@@ -1,0 +1,98 @@
+# Mini-Exchange config.
+#
+# Network settings live here so the same code runs unchanged from a laptop
+# (127.0.0.1) to the Hetzner VM later — just edit `host` values (or override
+# via the matching env vars below), never hardcode an address in code.
+#
+# Env var overrides (useful for docker-compose / prod) take precedence over
+# the values in this file. See src/exchange/config.py for the full mapping.
+
+network:
+  # Bind address for each service. Use 0.0.0.0 to accept connections from
+  # other machines (e.g. once this moves to the Hetzner VM); 127.0.0.1 keeps
+  # it local-only, which is the right default while testing on a laptop.
+  api:
+    host: "127.0.0.1"
+    port: 8000
+  admin_api:
+    host: "127.0.0.1"
+    port: 8001
+  website:
+    host: "127.0.0.1"
+    port: 8080
+
+  # Public-facing base URL students/admin use to reach each service. Locally
+  # this matches host:port above; once deployed, set this to the VM's real
+  # IP or hostname (e.g. "http://<hetzner-ip>:8000") without touching code.
+  public:
+    api_base_url: "http://127.0.0.1:8000"
+    admin_api_base_url: "http://127.0.0.1:8001"
+    website_base_url: "http://127.0.0.1:8080"
+
+database:
+  # Local default; docker-compose overrides via DATABASE_URL env var.
+  url: "postgresql+asyncpg://sim_engine:sim_engine@127.0.0.1:5432/sim_engine"
+
+# Index price is fully synthetic (no external feed — Kraken's live feed
+# proved too unreliable to depend on for a multi-day unattended run).
+# See src/exchange/synthetic_feed.py: a GBM random walk per product, plus
+# an autonomous task that fires random market events on its own timer, on
+# top of whatever the admin triggers manually.
+synthetic_feed:
+  tick_interval_seconds: 1.0
+  random_events_enabled: true
+  # Average seconds between autonomous random events (Poisson arrivals),
+  # across both products combined.
+  random_event_mean_interval_seconds: 240
+
+products:
+  BTC-MINI:
+    underlying: "BTC/USD"
+    contract_size: 0.001
+    max_position: 15
+    tick_size: 0.10
+    # Underlying (pre contract-size-scaling) starting price and annualized
+    # GBM volatility/drift driving the synthetic index (see synthetic_feed
+    # above). ~$77.5k matches build-spec.md §2's documented reference price.
+    starting_price: 77500.0
+    annual_volatility: 0.55
+    annual_drift: 0.0
+  ETH-MINI:
+    underlying: "ETH/USD"
+    contract_size: 0.03
+    max_position: 15
+    tick_size: 0.10
+    starting_price: 2430.0
+    annual_volatility: 0.70
+    annual_drift: 0.0
+
+accounts:
+  starting_cash: 1000.0
+  enforce_buying_power: false
+  freeze_on_zero_equity: false
+
+feed:
+  stale_threshold_seconds: 7
+  sma_window: 20
+  reconnect_blend_seconds: 7
+  shock_decay_seconds: 7
+
+rate_limit:
+  requests_per_second: 20
+  burst: 40
+  ws_connections_per_key: 1
+
+fees:
+  # Applied to every fill's notional (price * qty), on both sides. Negative
+  # maker_bps is a rebate (maker gets paid to add liquidity); positive
+  # taker_bps is a cost (taker pays to take liquidity).
+  maker_bps: -1.0
+  taker_bps: 2.0
+
+admin:
+  # Local dev default only — override via ADMIN_PASSWORD env var for any
+  # non-local deployment. Never commit a real password here.
+  password: "dev"
+
+website:
+  password: "dev"
