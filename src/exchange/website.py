@@ -375,17 +375,30 @@ async function trade(product, side, price, qtyOverride) {{
   ownOrdersCache = null;
   refreshAllLadders();
 }}
+// Tracks order ids with a cancel already in flight — without this, a
+// double-click (or a stale re-render landing a second click before the
+// first DELETE resolves) fires a second DELETE for the same id, which
+// comes back "order is not open" (400) and surfaces as a confusing
+// "cancel failed" alert for an action that actually already succeeded.
+const pendingCancels = new Set();
 async function cancelWorking(orderIds) {{
   const key = getKey();
   if (!key || !orderIds.length) return;
+  const idsToCancel = orderIds.filter(id => !pendingCancels.has(id));
+  if (!idsToCancel.length) return; // all already being cancelled — no-op
+  idsToCancel.forEach(id => pendingCancels.add(id));
   const failures = [];
-  for (const id of orderIds) {{
-    try {{
-      const r = await fetch(API_BASE + '/orders/' + id, {{ method: 'DELETE', headers: {{'X-API-Key': key}} }});
-      if (!r.ok) failures.push(id + ': ' + r.status);
-    }} catch (e) {{
-      failures.push(id + ': ' + e.message);
+  try {{
+    for (const id of idsToCancel) {{
+      try {{
+        const r = await fetch(API_BASE + '/orders/' + id, {{ method: 'DELETE', headers: {{'X-API-Key': key}} }});
+        if (!r.ok) failures.push(id + ': ' + r.status);
+      }} catch (e) {{
+        failures.push(id + ': ' + e.message);
+      }}
     }}
+  }} finally {{
+    idsToCancel.forEach(id => pendingCancels.delete(id));
   }}
   if (failures.length) {{
     // Silently ignoring a failed cancel (e.g. a 429 from the rate limiter)
@@ -401,20 +414,33 @@ async function cancelWorking(orderIds) {{
 // request rate against the student's own rate limit (20 req/s), which
 // otherwise sits close enough to the ceiling that a manual click can
 // occasionally get 429'd by background polling and silently do nothing.
+// The two product loops tick independently (~200ms each), so it's common
+// for both to call this within the same window before the first fetch has
+// resolved — without the in-flight dedup below, that fires two separate
+// fetches instead of sharing one, quietly doubling the real request rate.
 let ownOrdersCache = null;
 let ownOrdersCacheAt = 0;
+let ownOrdersInFlight = null;
 async function getOwnOrders() {{
   const key = getKey();
   if (!key) return null;
   const now = Date.now();
   if (ownOrdersCache && now - ownOrdersCacheAt < 150) return ownOrdersCache;
-  try {{
-    const r = await fetch(API_BASE + '/orders', {{ headers: {{'X-API-Key': key}} }});
-    if (!r.ok) return null;
-    ownOrdersCache = await r.json();
-    ownOrdersCacheAt = now;
-    return ownOrdersCache;
-  }} catch (e) {{ return null; }}
+  if (ownOrdersInFlight) return ownOrdersInFlight;
+  ownOrdersInFlight = (async () => {{
+    try {{
+      const r = await fetch(API_BASE + '/orders', {{ headers: {{'X-API-Key': key}} }});
+      if (!r.ok) return null;
+      ownOrdersCache = await r.json();
+      ownOrdersCacheAt = Date.now();
+      return ownOrdersCache;
+    }} catch (e) {{
+      return null;
+    }} finally {{
+      ownOrdersInFlight = null;
+    }}
+  }})();
+  return ownOrdersInFlight;
 }}
 async function loadOwnOrders(product) {{
   const orders = await getOwnOrders();
@@ -434,20 +460,30 @@ async function loadOwnOrders(product) {{
 // Shared across both products' ladders (not per-product) so showing
 // position/avg-entry above each ladder doesn't double the request rate —
 // one /account fetch covers every product's position in one response.
+// Same in-flight dedup reasoning as getOwnOrders above.
 let accountCache = null;
 let accountCacheAt = 0;
+let accountInFlight = null;
 async function getAccount() {{
   const key = getKey();
   if (!key) return null;
   const now = Date.now();
   if (accountCache && now - accountCacheAt < 150) return accountCache;
-  try {{
-    const r = await fetch(API_BASE + '/account', {{ headers: {{'X-API-Key': key}} }});
-    if (!r.ok) return null;
-    accountCache = await r.json();
-    accountCacheAt = now;
-    return accountCache;
-  }} catch (e) {{ return null; }}
+  if (accountInFlight) return accountInFlight;
+  accountInFlight = (async () => {{
+    try {{
+      const r = await fetch(API_BASE + '/account', {{ headers: {{'X-API-Key': key}} }});
+      if (!r.ok) return null;
+      accountCache = await r.json();
+      accountCacheAt = Date.now();
+      return accountCache;
+    }} catch (e) {{
+      return null;
+    }} finally {{
+      accountInFlight = null;
+    }}
+  }})();
+  return accountInFlight;
 }}
 
 // -- drag-to-reprice: drag a working cell onto another row's price to
@@ -776,12 +812,19 @@ def create_website_app(state: AppState) -> FastAPI:
         }}
       }}
 
-      ownByPrice = await loadOwnOrders(product);
+      // Render the book (bid/ask/price columns) right away, same-origin
+      // and fast, using last cycle's ownByPrice — don't make it wait on
+      // the cross-origin, preflighted own-orders/account lookups below.
+      // On a real network those add real round trips; blocking the visible
+      // book update on them was exactly why a click felt slow to reflect.
       renderRows();
+
+      const [own, account] = await Promise.all([loadOwnOrders(product), getAccount()]);
+      ownByPrice = own;
+      renderRows(); // cheap now — diffed, only the working column actually changes
 
       const posDiv = document.getElementById('position-{product}');
       if (posDiv) {{
-        const account = await getAccount();
         const pos = account && account.positions && account.positions['{product}'];
         posDiv.textContent = pos
           ? `position: ${{pos.qty}} @ $${{pos.avg_cost.toFixed(2)}}`

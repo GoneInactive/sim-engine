@@ -48,6 +48,14 @@ def create_public_app(state: AppState) -> FastAPI:
         allow_origins=[state.config.network.website_base_url],
         allow_methods=["*"],
         allow_headers=["*"],
+        # Without this, every cross-origin call carrying X-API-Key (i.e.
+        # every trade/cancel/orders/account/fills request) gets its own
+        # OPTIONS preflight round trip, and the browser re-preflights on
+        # every single call rather than caching it. Invisible on localhost
+        # (sub-ms either way) but on a real network this doubles the
+        # latency of every click — max_age lets the browser cache the
+        # preflight result instead of repeating it.
+        max_age=600,
     )
 
     def auth_dep(x_api_key: str = Header(...)) -> ApiKeyRecord:
