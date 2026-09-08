@@ -204,18 +204,12 @@ class MatchingEngine:
             if price is None:
                 raise OrderRejected("limit order requires a price")
             if price <= 0 and not self.products[product].allow_negative_price:
-                # Nothing upstream validated this — a single bad price (a
-                # buggy student notebook script, a malformed direct API
-                # call, anything bypassing the website's own click-driven
-                # grid) becomes the book's best bid/ask, and since the
-                # website's ladder centers itself on the book's own mid
-                # with no sanity bound, it would then center on garbage and
-                # every subsequent click would reinforce it further.
-                #
-                # The BTC-ETH spread instrument is the one legitimate
-                # exception (see ProductConfig.allow_negative_price) — its
-                # fair value is btc_index - eth_index, which an "invert"
-                # event deliberately pushes negative.
+                # ProductConfig.allow_negative_price defaults to True for
+                # every product now — this branch only fires for a product
+                # some caller explicitly opted out (none currently do).
+                # Kept as a real check, not deleted, since a future product
+                # config could still want a positive-price floor and the
+                # cost of keeping the guard is nothing.
                 raise OrderRejected(f"price must be positive, got {price}")
             tick_size = self.products[product].tick_size
             ticks = price / tick_size
@@ -266,16 +260,19 @@ class MatchingEngine:
                 self.books[product].insert_resting(order)
                 self._add_resting(order)
             else:
-                # market order: unfilled remainder is dropped (IOC), never rests
-                order.status = (
-                    OrderStatus.FILLED if order.remaining_qty == 0 else order.status
-                )
-                if order.status not in (OrderStatus.FILLED,):
-                    order.status = (
-                        OrderStatus.PARTIALLY_FILLED
-                        if order.remaining_qty < order.qty
-                        else order.status
-                    )
+                # Market order: IOC — whatever didn't fill is dropped, not
+                # left resting. _match already sets status to FILLED or
+                # PARTIALLY_FILLED for any real fill; a market order that
+                # matched nothing at all is left as OPEN by _match (it only
+                # touches .status on an actual fill), so that case needs
+                # handling here. Either way the remainder is done, not
+                # pending, so remaining_qty must go to zero — leaving it
+                # nonzero is what let a market order into a thin/empty book
+                # sit forever as "open" with remaining_qty == qty and a
+                # null price, indistinguishable from a real resting order.
+                if order.status is OrderStatus.OPEN:
+                    order.status = OrderStatus.CANCELLED
+                order.remaining_qty = 0
         return order
 
     def cancel_order(self, order_id: int, account_id: str) -> Order:

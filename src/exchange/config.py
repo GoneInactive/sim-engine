@@ -46,11 +46,13 @@ class ProductConfig:
     starting_price: float = 75.0
     annual_volatility: float = 0.6
     annual_drift: float = 0.0
-    # Only the BTC-ETH spread instrument sets this — btc_index - eth_index
-    # is designed to legitimately cross zero (an admin "invert" event
-    # flips its sign on purpose). Every other product is a real underlying
-    # price and should stay positive.
-    allow_negative_price: bool = False
+    # Every product accepts negative-priced limit orders. The BTC-ETH
+    # spread needs this unconditionally (btc_index - eth_index is designed
+    # to cross zero on an admin "invert" event); spot products and options
+    # don't need it in the same structural way, but nothing downstream
+    # (GBM step, Black-Scholes, ledger/PnL math) assumes a positive price
+    # either, so there's no correctness reason to keep them floored.
+    allow_negative_price: bool = True
 
 
 @dataclass(frozen=True)

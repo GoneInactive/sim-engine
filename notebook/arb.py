@@ -66,7 +66,13 @@ def _request(method, url, **kwargs):
     return r
 
 def login(account_id, password):
-    r = _request("POST", f"{BASE_URL}/login", json={"account_id": account_id, "password": password})
+    # /login 401s on an account_id that's never been registered - unlike
+    # mm.py/spread-trader.py, this had no fallback, so the bot couldn't
+    # even start under a fresh ACCOUNT_ID without a separate manual
+    # /register call first.
+    r = _request("POST", f"{BASE_URL}/register", json={"account_id": account_id, "password": password})
+    if r.status_code == 409:
+        r = _request("POST", f"{BASE_URL}/login", json={"account_id": account_id, "password": password})
     r.raise_for_status()
     return r.json()["api_key"]
 

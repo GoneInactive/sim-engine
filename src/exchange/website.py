@@ -1076,11 +1076,11 @@ poll('/data/leaderboard', (rows) => {
 <h2>Portfolio</h2>
 <div class="metrics" id="pf-summary"></div>
 
-<h2>Positions</h2>
+<h2>Positions <button onclick="flattenAllPositions()" style="font-size:12px; padding:2px 8px; margin-left:8px;">Flatten all</button></h2>
 <table><thead><tr><th>Product</th><th>Qty</th><th>Avg cost</th></tr></thead>
 <tbody id="pf-positions"></tbody></table>
 
-<h2>Open orders</h2>
+<h2>Open orders <button onclick="cancelAllOrders()" style="font-size:12px; padding:2px 8px; margin-left:8px;">Cancel all</button></h2>
 <table><thead><tr><th>ID</th><th>Product</th><th>Side</th><th>Type</th><th>Qty</th><th>Price</th><th>Remaining</th><th>Status</th></tr></thead>
 <tbody id="pf-orders"></tbody></table>
 
@@ -1125,6 +1125,46 @@ function render(d) {
 }
 window.onLogin = loadPortfolio;
 loadPortfolio();
+
+async function cancelAllOrders() {
+  const key = getKey();
+  if (!key) { alert('log in above first'); return; }
+  const orders = await getOwnOrders();
+  const openIds = (orders || [])
+    .filter(o => o.status === 'open' || o.status === 'partially_filled')
+    .map(o => o.id);
+  if (!openIds.length) { alert('no open orders to cancel'); return; }
+  if (!confirm(`Cancel ${openIds.length} open order(s)?`)) return;
+  await cancelWorking(openIds);
+  loadPortfolio();
+}
+
+async function flattenAllPositions() {
+  const key = getKey();
+  if (!key) { alert('log in above first'); return; }
+  const account = await getAccount();
+  const entries = Object.entries((account && account.positions) || {}).filter(([, pos]) => pos.qty !== 0);
+  if (!entries.length) { alert('no open positions to flatten'); return; }
+  if (!confirm(`Flatten ${entries.length} position(s) with market orders?`)) return;
+  for (const [product, pos] of entries) {
+    const side = pos.qty > 0 ? 'sell' : 'buy';
+    try {
+      const r = await fetch(API_BASE + '/orders', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json', 'X-API-Key': key},
+        body: JSON.stringify({product, side, type: 'market', qty: Math.abs(pos.qty)}),
+      });
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}));
+        alert(`flatten ${product} failed: ${d.detail || r.status}`);
+      }
+    } catch (e) {
+      alert(`flatten ${product} failed: ${e.message}`);
+    }
+  }
+  accountCache = null;
+  loadPortfolio();
+}
 </script>
 """
         return page(body)
