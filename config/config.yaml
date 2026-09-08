@@ -18,8 +18,8 @@ network:
     host: "127.0.0.1"
     port: 8001
   website:
-    host: "127.0.0.1"
-    port: 8080
+    host: "0.0.0.0"
+    port: 8090
 
   # Public-facing base URL students/admin use to reach each service. Locally
   # this matches host:port above; once deployed, set this to the VM's real
@@ -27,7 +27,7 @@ network:
   public:
     api_base_url: "http://127.0.0.1:8000"
     admin_api_base_url: "http://127.0.0.1:8001"
-    website_base_url: "http://127.0.0.1:8080"
+    website_base_url: "http://178.105.55.5:8090"
 
 database:
   # Local default; docker-compose overrides via DATABASE_URL env var.
