@@ -12,10 +12,10 @@ network:
   # other machines (e.g. once this moves to the Hetzner VM); 127.0.0.1 keeps
   # it local-only, which is the right default while testing on a laptop.
   api:
-    host: "127.0.0.1"
+    host: "0.0.0.0"
     port: 8000
   admin_api:
-    host: "127.0.0.1"
+    host: "0.0.0.0"
     port: 8001
   website:
     host: "0.0.0.0"
@@ -24,9 +24,14 @@ network:
   # Public-facing base URL students/admin use to reach each service. Locally
   # this matches host:port above; once deployed, set this to the VM's real
   # IP or hostname (e.g. "http://<hetzner-ip>:8000") without touching code.
+  # This has to be the real public IP, not 127.0.0.1 — the website page's
+  # own JS embeds api_base_url and calls it directly from each student's
+  # browser (not proxied through this server), so 127.0.0.1 there would
+  # resolve to the student's own machine and every register/login/order
+  # call would silently go nowhere.
   public:
-    api_base_url: "http://127.0.0.1:8000"
-    admin_api_base_url: "http://127.0.0.1:8001"
+    api_base_url: "http://178.105.55.5:8000"
+    admin_api_base_url: "http://178.105.55.5:8001"
     website_base_url: "http://178.105.55.5:8090"
 
 database:
