@@ -915,7 +915,7 @@ function renderOptionCell(id, c) {{
   const el = document.getElementById(id);
   if (!el || !c) return;
   const fmt = (v) => v === null || v === undefined ? 'n/a' : v.toFixed(2);
-  el.textContent = `${{fmt(c.theo)}} / ${{fmt(c.bid)}} / ${{fmt(c.ask)}}`;
+  el.innerHTML = `<a href="/options/${{encodeURIComponent(c.symbol)}}">${{fmt(c.theo)}} / ${{fmt(c.bid)}} / ${{fmt(c.ask)}}</a>`;
 }}
 poll('/data/options', (d) => {{
   document.getElementById('opt-expiry').textContent = d.expiry_ts
@@ -927,6 +927,25 @@ poll('/data/options', (d) => {{
 </script>
 """
         return page(body)
+
+    @app.get("/options/{symbol}", response_class=HTMLResponse)
+    def option_ladder(symbol: str):
+        opt = state.options_manager.chain.get(symbol)
+        if opt is None:
+            body = (
+                f'<h2>{symbol}</h2>'
+                '<p class="meta">This contract is no longer active (expired/settled, or the chain has rolled). '
+                '<a href="/options">Back to Options Chain</a></p>'
+            )
+            return page(body)
+        header = (
+            f'<h2>{symbol}</h2>'
+            f'<p class="meta">{opt.option_type.upper()} &middot; strike {opt.strike:.2f} &middot; '
+            f'expiry {time.strftime("%H:%M:%S UTC", time.gmtime(opt.expiry_ts))} &middot; '
+            '<a href="/options">Back to Options Chain</a></p>'
+        )
+        tick = state.config.options.tick_size
+        return page(header + f'<div class="cols">{_ladder_block(symbol, tick)}</div>')
 
     @app.get("/data/options")
     def data_options():
