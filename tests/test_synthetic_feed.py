@@ -6,9 +6,11 @@ from exchange.config import (
     FeedConfig,
     FeesConfig,
     NetworkConfig,
+    OptionsConfig,
     ProductConfig,
     RateLimitConfig,
     ServiceNetwork,
+    SpreadInstrumentConfig,
     SyntheticFeedConfig,
 )
 from exchange.index_feed import IndexPriceService
@@ -49,6 +51,14 @@ def make_config(random_events_enabled=True, mean_interval=240.0):
         fees=FeesConfig(maker_bps=-1.0, taker_bps=2.0),
         admin_password="admin-pw",
         website_password="site-pw",
+        spread=SpreadInstrumentConfig(
+            enabled_default=False, symbol="BTC-ETH-MINI", btc_product="BTC-MINI", eth_product="ETH-MINI",
+            contract_size=1.0, max_position=15, tick_size=0.10,
+        ),
+        options=OptionsConfig(
+            enabled_default=False, underlying="BTC-MINI", window_seconds=900.0, strikes_each_side=5,
+            strike_increment=500.0, implied_volatility=0.55, contract_size=0.001, max_position=15, tick_size=0.10,
+        ),
     )
 
 

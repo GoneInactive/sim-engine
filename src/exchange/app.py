@@ -17,6 +17,7 @@ import uvicorn
 from .api_admin import create_admin_app
 from .api_public import create_public_app
 from .config import load_config
+from .options import OptionsScheduler
 from .state import AppState
 from .synthetic_feed import RandomEventScheduler, SyntheticFeedClient
 from .website import create_website_app
@@ -47,10 +48,12 @@ async def main() -> None:
 
     feed_client = SyntheticFeedClient(config, state.index_service, state.synthetic_params)
     random_events = RandomEventScheduler(state.index_service, state.bot_manager, config)
+    options_scheduler = OptionsScheduler(state.options_manager, state)
 
     async def sample_price_history(interval_seconds: float = 1.0) -> None:
         while True:
             state.record_price_tick()
+            state.options_manager.price_tick()
             await asyncio.sleep(interval_seconds)
 
     logger.info("starting: api=%s admin_api=%s website=%s",
@@ -60,6 +63,7 @@ async def main() -> None:
         *(s.serve() for s in servers),
         feed_client.run(),
         random_events.run(),
+        options_scheduler.run(),
         state.bot_manager.run_forever(),
         sample_price_history(),
     )

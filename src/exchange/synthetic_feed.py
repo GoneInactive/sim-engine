@@ -68,6 +68,7 @@ class SyntheticFeedClient:
     async def run(self) -> None:
         interval = self.config.synthetic_feed.tick_interval_seconds
         logger.info("synthetic_feed: starting, tick_interval=%.2fs", interval)
+        spread_cfg = self.config.spread
         while not self._stop:
             now = time.time()
             for symbol in self.config.products:
@@ -76,6 +77,17 @@ class SyntheticFeedClient:
                     self.prices[symbol], p["annual_drift"], p["annual_volatility"], interval
                 )
                 self.index_service.on_raw_tick(symbol, self.prices[symbol], now)
+
+            # BTC-ETH mini spread: derived, not its own GBM walk — its
+            # index price is just BTC's index minus ETH's (both already
+            # contract-notional-scaled), computed fresh from whatever the
+            # two legs just ticked to (including any admin shock/drift
+            # offsets already layered onto them).
+            btc_index = self.index_service.get_index_price(spread_cfg.btc_product, now)
+            eth_index = self.index_service.get_index_price(spread_cfg.eth_product, now)
+            if btc_index is not None and eth_index is not None:
+                self.index_service.on_raw_tick(spread_cfg.symbol, btc_index - eth_index, now)
+
             await asyncio.sleep(interval)
 
 

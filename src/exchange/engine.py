@@ -111,7 +111,12 @@ def _crosses(taker_side: Side, taker_price: float | None, maker_price: float) ->
 
 class MatchingEngine:
     def __init__(self, products: dict[str, ProductConfig], maker_fee_bps: float = -1.0, taker_fee_bps: float = 2.0):
-        self.products = products
+        # Copied, not aliased: add_product/remove_product mutate this dict
+        # at runtime (dynamic option contracts, the spread instrument), and
+        # must never leak those changes back into the caller's own dict —
+        # historically the same object as Config.products, whose whole
+        # point is to stay exactly the statically-configured product set.
+        self.products = dict(products)
         self.books: dict[str, _Book] = {symbol: _Book() for symbol in products}
         self.accounts: dict[str, Account] = {}
         self.orders: dict[int, Order] = {}
@@ -140,6 +145,26 @@ class MatchingEngine:
         # account — it needs to be able to absorb size without the same
         # cap a student is bounded by).
         self.unlimited_position_accounts: set[str] = set()
+
+    # -- dynamic products ------------------------------------------------
+    def add_product(self, cfg: ProductConfig) -> None:
+        """Registers a new tradeable instrument at runtime (options
+        chain contracts, the spread instrument) without disturbing any
+        product registered at construction time."""
+        self.products[cfg.symbol] = cfg
+        self.books[cfg.symbol] = _Book()
+        self.volume_qty[cfg.symbol] = 0
+        self.volume_notional[cfg.symbol] = 0.0
+
+    def remove_product(self, symbol: str) -> None:
+        """Retires an instrument (e.g. an expired option contract) once
+        it has been fully settled — no open orders/positions should
+        remain against it. Trade/fill history referencing the symbol is
+        untouched (it's just a string on old Fill/Order records)."""
+        self.products.pop(symbol, None)
+        self.books.pop(symbol, None)
+        self.volume_qty.pop(symbol, None)
+        self.volume_notional.pop(symbol, None)
 
     # -- accounts -----------------------------------------------------
     def get_or_create_account(self, account_id: str, starting_cash: float) -> Account:

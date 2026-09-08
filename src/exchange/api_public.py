@@ -100,13 +100,13 @@ def create_public_app(state: AppState) -> FastAPI:
 
     @app.get("/book/{product}")
     def get_book(product: str, auth: ApiKeyRecord = Depends(auth_dep)):
-        if product not in state.config.products:
+        if product not in state.engine.products:
             raise HTTPException(status_code=404, detail="unknown product")
         return state.engine.book_snapshot(product)
 
     @app.websocket("/book/{product}/stream")
     async def stream_book(websocket: WebSocket, product: str):
-        if product not in state.config.products:
+        if product not in state.engine.products:
             await websocket.close(code=4404)
             return
         api_key = websocket.query_params.get("api_key")
@@ -124,6 +124,8 @@ def create_public_app(state: AppState) -> FastAPI:
 
     @app.post("/orders")
     def submit_order(order: OrderIn, auth: ApiKeyRecord = Depends(auth_dep)):
+        if not state.is_tradeable(order.product):
+            raise HTTPException(status_code=400, detail=f"{order.product} is currently disabled")
         try:
             result = state.engine.submit_order(
                 auth.account_id, order.product, order.side, order.type, order.qty, order.price

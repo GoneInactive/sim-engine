@@ -72,12 +72,26 @@ class _ProductState:
 class IndexPriceService:
     def __init__(self, feed_cfg: FeedConfig, products: dict[str, ProductConfig]):
         self.feed_cfg = feed_cfg
-        self.products = products
+        # Copied, not aliased — see engine.py's MatchingEngine.__init__ for
+        # why: add_product/remove_product must not leak into the caller's
+        # own dict (historically the same object as Config.products).
+        self.products = dict(products)
         self.state: dict[str, _ProductState] = {
             symbol: _ProductState(recent_ticks=deque(maxlen=feed_cfg.sma_window))
             for symbol in products
         }
         self.events: dict[str, list[OffsetEvent]] = {symbol: [] for symbol in products}
+
+    # -- dynamic products ------------------------------------------------
+    def add_product(self, cfg: ProductConfig) -> None:
+        self.products[cfg.symbol] = cfg
+        self.state[cfg.symbol] = _ProductState(recent_ticks=deque(maxlen=self.feed_cfg.sma_window))
+        self.events[cfg.symbol] = []
+
+    def remove_product(self, symbol: str) -> None:
+        self.products.pop(symbol, None)
+        self.state.pop(symbol, None)
+        self.events.pop(symbol, None)
 
     # -- ingestion --------------------------------------------------------
     def on_raw_tick(self, product: str, underlying_price: float, now: float) -> None:

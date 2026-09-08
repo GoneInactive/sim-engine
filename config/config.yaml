@@ -66,6 +66,52 @@ products:
     annual_volatility: 0.70
     annual_drift: 0.0
 
+# BTC-ETH mini spread: a single synthetic tradeable instrument whose price
+# is BTC-MINI's index price minus ETH-MINI's index price (both already
+# contract-notional-scaled — same convention as the admin's BTC/ETH spread
+# *event*). Admin can enable/disable at any time from the admin page; the
+# order book always exists, but student orders are rejected while disabled
+# and its bots go passive.
+spread:
+  enabled_default: false
+  symbol: "BTC-ETH-MINI"
+  btc_product: "BTC-MINI"
+  eth_product: "ETH-MINI"
+  contract_size: 1.0
+  max_position: 15
+  tick_size: 0.10
+
+# 15-minute European BTC options. A fresh strike chain (calls + puts around
+# ATM) is generated automatically every window_seconds while enabled, priced
+# by a per-contract market-maker bot quoting around a Black-Scholes theo
+# (see src/exchange/options.py), and cash-settled against the underlying's
+# index price at expiry. Admin can enable/disable at any time; disabling
+# stops new chains from being created but lets any in-flight chain settle
+# normally rather than stranding open positions.
+#
+# strike_increment is in the underlying's own *contract-scaled* index-price
+# units (the same ~77.5 space BTC-MINI itself quotes in, i.e. real BTC/USD
+# price * BTC-MINI's contract_size) — not raw BTC/USD dollars. 1.0 here
+# spaces strikes about $1000 apart in real BTC/USD terms.
+options:
+  enabled_default: false
+  underlying: "BTC-MINI"
+  window_seconds: 900
+  strikes_each_side: 5
+  strike_increment: 1.0
+  implied_volatility: 0.55
+  # 1.0, not BTC-MINI's own 0.001: price_tick() already feeds a fully
+  # contract-scaled Black-Scholes theo straight into on_raw_tick, which
+  # itself multiplies by contract_size again — anything but 1.0 here
+  # silently rescales every option's price a second time.
+  contract_size: 1.0
+  max_position: 15
+  # A 15-minute option's extrinsic value is genuinely tiny in this
+  # contract-scaled price space (BS time value ~$0.09 even ATM, per
+  # build/verification notes) — a coarser tick would round most of the
+  # chain's bid side down to zero and make it untradeable.
+  tick_size: 0.01
+
 accounts:
   starting_cash: 1000.0
   enforce_buying_power: false

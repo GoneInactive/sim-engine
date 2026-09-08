@@ -14,10 +14,11 @@ from collections import deque
 
 from .auth import AccountExistsError, AuthStore
 from .bots import BotManager
-from .config import Config
+from .config import Config, ProductConfig
 from .engine import MatchingEngine
 from .index_feed import IndexPriceService
 from .ledger import equity, unrealized_pnl
+from .options import OptionsChainManager, next_boundary
 
 PRICE_HISTORY_LEN = 120
 ADMIN_TRADING_ACCOUNT_ID = "admin"
@@ -54,6 +55,64 @@ class AppState:
         self.engine.unlimited_position_accounts.add(ADMIN_TRADING_ACCOUNT_ID)
         self.auth.register(ADMIN_TRADING_ACCOUNT_ID, config.admin_password)
 
+        # -- BTC-ETH mini spread instrument ---------------------------------
+        # Registered unconditionally (own order book, own bots) but never
+        # added to config.products — it lives only in engine/index_service
+        # so the homepage's product grid and admin Market tab are unaffected.
+        # `spread_enabled` gates student order submission and its bots'
+        # `.active` flag; the book itself always exists.
+        spread_cfg = ProductConfig(
+            symbol=config.spread.symbol,
+            underlying=f"{config.spread.btc_product}-{config.spread.eth_product}",
+            contract_size=config.spread.contract_size,
+            max_position=config.spread.max_position,
+            tick_size=config.spread.tick_size,
+        )
+        self.engine.add_product(spread_cfg)
+        self.index_service.add_product(spread_cfg)
+        self.bot_manager.spawn_defaults([config.spread.symbol])
+        self.spread_enabled = config.spread.enabled_default
+        if not self.spread_enabled:
+            self._set_bots_active(config.spread.symbol, False)
+        self.price_history[config.spread.symbol] = deque(maxlen=PRICE_HISTORY_LEN)
+
+        # -- 15-minute BTC options chain ---------------------------------
+        self.options_manager = OptionsChainManager(self.engine, self.index_service, self.bot_manager, config.options)
+        self.options_enabled = config.options.enabled_default
+        if self.options_enabled:
+            now = time.time()
+            self.options_manager.create_chain(now, next_boundary(now, config.options.window_seconds))
+
+    def _set_bots_active(self, product: str, active: bool) -> None:
+        for bot in self.bot_manager.mm_bots:
+            if bot.product == product:
+                bot.config.active = active
+        for bot in self.bot_manager.noise_bots:
+            if bot.product == product:
+                bot.config.active = active
+        for bot in self.bot_manager.arb_bots:
+            if bot.product == product:
+                bot.config.active = active
+
+    def set_spread_enabled(self, enabled: bool) -> bool:
+        self.spread_enabled = enabled
+        self._set_bots_active(self.config.spread.symbol, enabled)
+        return self.spread_enabled
+
+    def set_options_enabled(self, enabled: bool) -> bool:
+        self.options_enabled = enabled
+        if enabled and not self.options_manager.chain:
+            now = time.time()
+            self.options_manager.create_chain(now, next_boundary(now, self.config.options.window_seconds))
+        return self.options_enabled
+
+    def is_tradeable(self, symbol: str) -> bool:
+        if symbol == self.config.spread.symbol:
+            return self.spread_enabled
+        if symbol in self.options_manager.chain:
+            return self.options_enabled
+        return True
+
     def _book_mid(self, product: str) -> tuple[float | None, float | None, float | None]:
         """Returns (best_bid, best_ask, mid) — mid is None (not a fallback
         value) whenever the book is one-sided, so callers that display it
@@ -73,7 +132,7 @@ class AppState:
         only here (to keep the series continuous) when the book is
         momentarily one-sided, e.g. before the first MM bot has quoted."""
         now = now if now is not None else time.time()
-        for product in self.config.products:
+        for product in (*self.config.products, self.config.spread.symbol):
             _, _, mid = self._book_mid(product)
             if mid is None:
                 mid = self.index_service.get_index_price(product, now)

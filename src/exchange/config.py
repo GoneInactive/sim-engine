@@ -84,6 +84,30 @@ class FeesConfig:
 
 
 @dataclass(frozen=True)
+class SpreadInstrumentConfig:
+    enabled_default: bool
+    symbol: str
+    btc_product: str
+    eth_product: str
+    contract_size: float
+    max_position: int
+    tick_size: float
+
+
+@dataclass(frozen=True)
+class OptionsConfig:
+    enabled_default: bool
+    underlying: str
+    window_seconds: float
+    strikes_each_side: int
+    strike_increment: float
+    implied_volatility: float
+    contract_size: float
+    max_position: int
+    tick_size: float
+
+
+@dataclass(frozen=True)
 class Config:
     network: NetworkConfig
     database_url: str
@@ -95,6 +119,8 @@ class Config:
     fees: FeesConfig
     admin_password: str
     website_password: str
+    spread: SpreadInstrumentConfig
+    options: OptionsConfig
 
 
 def load_config(path: Path | str | None = None) -> Config:
@@ -167,6 +193,30 @@ def load_config(path: Path | str | None = None) -> Config:
         taker_bps=float(fees_raw.get("taker_bps", 2.0)),
     )
 
+    spread_raw = raw.get("spread", {})
+    spread = SpreadInstrumentConfig(
+        enabled_default=bool(spread_raw.get("enabled_default", False)),
+        symbol=spread_raw.get("symbol", "BTC-ETH-MINI"),
+        btc_product=spread_raw.get("btc_product", "BTC-MINI"),
+        eth_product=spread_raw.get("eth_product", "ETH-MINI"),
+        contract_size=float(spread_raw.get("contract_size", 1.0)),
+        max_position=int(spread_raw.get("max_position", 15)),
+        tick_size=float(spread_raw.get("tick_size", 0.10)),
+    )
+
+    options_raw = raw.get("options", {})
+    options = OptionsConfig(
+        enabled_default=bool(options_raw.get("enabled_default", False)),
+        underlying=options_raw.get("underlying", "BTC-MINI"),
+        window_seconds=float(options_raw.get("window_seconds", 900.0)),
+        strikes_each_side=int(options_raw.get("strikes_each_side", 5)),
+        strike_increment=float(options_raw.get("strike_increment", 1.0)),
+        implied_volatility=float(options_raw.get("implied_volatility", 0.55)),
+        contract_size=float(options_raw.get("contract_size", 1.0)),
+        max_position=int(options_raw.get("max_position", 15)),
+        tick_size=float(options_raw.get("tick_size", 0.01)),
+    )
+
     return Config(
         network=network,
         database_url=_env("DATABASE_URL", raw["database"]["url"]),
@@ -178,4 +228,6 @@ def load_config(path: Path | str | None = None) -> Config:
         fees=fees,
         admin_password=_env("ADMIN_PASSWORD", raw["admin"]["password"]),
         website_password=_env("WEBSITE_PASSWORD", raw["website"]["password"]),
+        spread=spread,
+        options=options,
     )

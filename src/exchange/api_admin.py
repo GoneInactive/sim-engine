@@ -109,6 +109,10 @@ class SpreadScaleIn(BaseModel):
     scale: float
 
 
+class EnabledIn(BaseModel):
+    enabled: bool
+
+
 def create_admin_app(state: AppState) -> FastAPI:
     app = FastAPI(title="Mini-Exchange Admin API")
 
@@ -346,6 +350,36 @@ def create_admin_app(state: AppState) -> FastAPI:
             raise HTTPException(status_code=404, detail="unknown product")
         return state.market_snapshot(product)
 
+    # -- instrument enable/disable -----------------------------------------
+    @app.get("/instruments/spread", dependencies=[Depends(admin_auth)])
+    def get_spread_instrument():
+        return {"symbol": state.config.spread.symbol, "enabled": state.spread_enabled}
+
+    @app.post("/instruments/spread/enabled", dependencies=[Depends(admin_auth)])
+    def set_spread_instrument_enabled(body: EnabledIn):
+        return {"symbol": state.config.spread.symbol, "enabled": state.set_spread_enabled(body.enabled)}
+
+    @app.get("/instruments/options", dependencies=[Depends(admin_auth)])
+    def get_options_instrument():
+        now = time.time()
+        contracts = []
+        for opt in sorted(state.options_manager.chain.values(), key=lambda o: (o.strike, o.option_type)):
+            book = state.engine.book_snapshot(opt.symbol, depth=1)
+            contracts.append({
+                "symbol": opt.symbol,
+                "strike": opt.strike,
+                "option_type": opt.option_type,
+                "expiry_ts": opt.expiry_ts,
+                "theo": state.index_service.get_index_price(opt.symbol, now),
+                "bid": book["bids"][0]["price"] if book["bids"] else None,
+                "ask": book["asks"][0]["price"] if book["asks"] else None,
+            })
+        return {"enabled": state.options_enabled, "underlying": state.config.options.underlying, "contracts": contracts}
+
+    @app.post("/instruments/options/enabled", dependencies=[Depends(admin_auth)])
+    def set_options_instrument_enabled(body: EnabledIn):
+        return {"enabled": state.set_options_enabled(body.enabled)}
+
     @app.get("/", response_class=HTMLResponse, dependencies=[Depends(admin_auth)])
     def admin_page():
         products = list(state.config.products.keys())
@@ -396,15 +430,37 @@ ADMIN_PAGE = """<!doctype html>
   svg.spark { border:1px solid #000; }
   .stale { font-weight:bold; }
   nav a { color:#000; text-decoration:none; margin-right:20px; border-bottom:1px solid #000; }
+  .tabs { display:flex; gap:4px; flex-wrap:wrap; border-bottom:1px solid #000; margin:20px 0 0; }
+  .tab-btn { padding:8px 14px; border:1px solid #000; border-bottom:none; background:#fff; color:#000; cursor:pointer; font-family:inherit; font-size:13px; position:relative; top:1px; }
+  .tab-btn.active { background:#000; color:#fff; }
+  .tab-panel { border-top:1px solid #000; padding-top:4px; }
+  .tab-panel[hidden] { display:none; }
+  .badge { display:inline-block; padding:2px 8px; font-size:11px; border:1px solid #000; margin-left:8px; }
+  .badge.on { background:#000; color:#fff; }
 </style>
 </head>
 <body>
 <h1>Mini-Exchange Admin</h1>
 <nav><a href="__WEBSITE_URL__" target="_blank">Website</a></nav>
 
+<div class="tabs">
+  <button class="tab-btn" data-tab="market" onclick="showTab('market')">Market</button>
+  <button class="tab-btn" data-tab="accounts" onclick="showTab('accounts')">Accounts</button>
+  <button class="tab-btn" data-tab="events" onclick="showTab('events')">Market events</button>
+  <button class="tab-btn" data-tab="feed" onclick="showTab('feed')">Feed control</button>
+  <button class="tab-btn" data-tab="mmbots" onclick="showTab('mmbots')">MM bots</button>
+  <button class="tab-btn" data-tab="noisebots" onclick="showTab('noisebots')">Noise bots</button>
+  <button class="tab-btn" data-tab="arbbot" onclick="showTab('arbbot')">Arb bot</button>
+  <button class="tab-btn" data-tab="options" onclick="showTab('options')">Options</button>
+  <button class="tab-btn" data-tab="spread" onclick="showTab('spread')">Spread</button>
+</div>
+
+<div class="tab-panel" data-tab="market">
 <h2>Market</h2>
 <div class="cols">__MARKET_COLS__</div>
+</div>
 
+<div class="tab-panel" data-tab="accounts">
 <h2>Accounts</h2>
 <div class="row">
   <fieldset>
@@ -433,7 +489,9 @@ ADMIN_PAGE = """<!doctype html>
 </div>
 <button onclick="loadAccounts()">Refresh account list</button>
 <table><thead><tr><th>Account</th><th>API key</th><th>Active</th></tr></thead><tbody id="accounts-table"></tbody></table>
+</div>
 
+<div class="tab-panel" data-tab="events" hidden>
 <h2>Market events</h2>
 <div class="row">
   <fieldset>
@@ -468,7 +526,9 @@ ADMIN_PAGE = """<!doctype html>
     <button onclick="triggerLiquidity()">Trigger liquidity event</button>
   </fieldset>
 </div>
+</div>
 
+<div class="tab-panel" data-tab="feed" hidden>
 <h2>Feed control</h2>
 <div class="row">
   <fieldset>
@@ -495,7 +555,9 @@ ADMIN_PAGE = """<!doctype html>
     <button onclick="setSpreadScale()">Set</button>
   </fieldset>
 </div>
+</div>
 
+<div class="tab-panel" data-tab="mmbots" hidden>
 <h2>Market maker bots</h2>
 <div class="row">
   <fieldset>
@@ -518,7 +580,9 @@ ADMIN_PAGE = """<!doctype html>
 </div>
 <button onclick="loadBots()">Refresh MM bot list</button>
 <table><thead><tr><th>Account</th><th>Product</th><th>Spread frac</th><th>Size</th><th>Active</th><th></th></tr></thead><tbody id="bots-table"></tbody></table>
+</div>
 
+<div class="tab-panel" data-tab="noisebots" hidden>
 <h2>Liquidity-taking (noise) bots</h2>
 <div class="row">
   <fieldset>
@@ -531,18 +595,47 @@ ADMIN_PAGE = """<!doctype html>
 </div>
 <button onclick="loadNoiseBots()">Refresh noise bot list</button>
 <table><thead><tr><th>Account</th><th>Product</th><th>Arrival rate/s</th><th>Max size</th><th>Active</th><th></th></tr></thead><tbody id="noise-bots-table"></tbody></table>
+</div>
 
+<div class="tab-panel" data-tab="arbbot" hidden>
 <h2>Arb bot</h2>
 <p style="font-size:13px;">Unlimited cash, no position cap. Steps in with a market order whenever the book drifts more than
 <code>threshold_ticks</code> from the index — a backstop so a well-funded student can't hold the traded price away
 from fair value. One spawns per product automatically.</p>
 <button onclick="loadArbBots()">Refresh arb bot list</button>
 <table><thead><tr><th>Account</th><th>Product</th><th>Threshold (ticks)</th><th>Correction qty</th><th>Active</th><th></th></tr></thead><tbody id="arb-bots-table"></tbody></table>
+</div>
+
+<div class="tab-panel" data-tab="options" hidden>
+<h2>15-min BTC options <span class="badge" id="options-badge">?</span></h2>
+<p style="font-size:13px;">A fresh call/put strike chain around ATM is created automatically every window while enabled,
+priced by Black-Scholes and quoted by one MM bot per contract. Disabling stops new chains from being created but lets
+any chain already in flight settle normally. <a href="__WEBSITE_URL__/options" target="_blank">Open Options Chain page</a></p>
+<button onclick="setOptionsEnabled(true)">Enable</button>
+<button onclick="setOptionsEnabled(false)">Disable</button>
+<button onclick="loadOptions()">Refresh</button>
+<table><thead><tr><th>Symbol</th><th>Strike</th><th>Type</th><th>Theo</th><th>Bid</th><th>Ask</th></tr></thead><tbody id="options-table"></tbody></table>
+</div>
+
+<div class="tab-panel" data-tab="spread" hidden>
+<h2>BTC-ETH mini spread <span class="badge" id="spread-badge">?</span></h2>
+<p style="font-size:13px;">A single tradeable instrument priced as BTC-MINI's index minus ETH-MINI's index.
+<a href="__WEBSITE_URL__/spread" target="_blank">Open Spread Matrix page</a></p>
+<button onclick="setSpreadEnabled(true)">Enable</button>
+<button onclick="setSpreadEnabled(false)">Disable</button>
+<button onclick="loadSpread()">Refresh</button>
+</div>
 
 <h2>Result</h2>
 <pre id="result">no result yet</pre>
 
 <script>
+function showTab(name) {
+  document.querySelectorAll('.tab-panel').forEach(el => { el.hidden = el.dataset.tab !== name; });
+  document.querySelectorAll('.tab-btn').forEach(el => { el.classList.toggle('active', el.dataset.tab === name); });
+  localStorage.setItem('admin-active-tab', name);
+}
+showTab(localStorage.getItem('admin-active-tab') || 'market');
 function val(id) { return document.getElementById(id).value; }
 
 function requireVal(id, label) {
@@ -771,10 +864,41 @@ function setBotParams() {
   callApi('POST', '/bots/' + val('bot-id') + '/params', body).then(loadBots);
 }
 
+async function loadOptions() {
+  const res = await fetch('/instruments/options');
+  const d = await res.json();
+  const badge = document.getElementById('options-badge');
+  badge.textContent = d.enabled ? 'ENABLED' : 'DISABLED';
+  badge.classList.toggle('on', d.enabled);
+  const fmt = (v) => v === null || v === undefined ? 'n/a' : v.toFixed(2);
+  document.getElementById('options-table').innerHTML = d.contracts.map(c =>
+    `<tr><td>${c.symbol}</td><td>${c.strike}</td><td>${c.option_type}</td>` +
+    `<td>${fmt(c.theo)}</td><td>${fmt(c.bid)}</td><td>${fmt(c.ask)}</td></tr>`
+  ).join('') || '<tr><td colspan="6">no active chain</td></tr>';
+}
+function setOptionsEnabled(enabled) {
+  callApi('POST', '/instruments/options/enabled', { enabled }).then(loadOptions);
+}
+
+async function loadSpread() {
+  const res = await fetch('/instruments/spread');
+  const d = await res.json();
+  const badge = document.getElementById('spread-badge');
+  badge.textContent = d.enabled ? 'ENABLED' : 'DISABLED';
+  badge.classList.toggle('on', d.enabled);
+}
+function setSpreadEnabled(enabled) {
+  callApi('POST', '/instruments/spread/enabled', { enabled }).then(loadSpread);
+}
+
 loadAccounts();
 loadBots();
 loadNoiseBots();
 loadArbBots();
+loadOptions();
+loadSpread();
+setInterval(loadOptions, 5000);
+setInterval(loadSpread, 5000);
 </script>
 </body>
 </html>"""

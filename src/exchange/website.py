@@ -18,6 +18,8 @@ directly, no HTTP hop needed since this runs in the same process.
 """
 from __future__ import annotations
 
+import time
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -114,11 +116,27 @@ function clearSession() {{
   lastSeenFillId = null;
 }}
 
+// -- mute: suppresses both fill banners and the fill sound, persisted per
+// browser so it survives a page reload / navigating between pages ---------
+function isMuted() {{
+  try {{ return localStorage.getItem('exchange-muted') === '1'; }} catch (e) {{ return false; }}
+}}
+function renderMuteButton() {{
+  const btn = document.getElementById('mute-btn');
+  if (!btn) return;
+  btn.textContent = isMuted() ? 'Unmute' : 'Mute notifications';
+}}
+function toggleMute() {{
+  try {{ localStorage.setItem('exchange-muted', isMuted() ? '0' : '1'); }} catch (e) {{}}
+  renderMuteButton();
+}}
+
 // -- fill notifications: banner + sound, on every page ----------------------
 // Seeded to the current max fill id on login/page-load so a student isn't
 // flooded with notifications for fills that happened before this session.
 let lastSeenFillId = null;
 function playFillSound() {{
+  if (isMuted()) return;
   try {{
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     const osc = ctx.createOscillator();
@@ -134,6 +152,7 @@ function playFillSound() {{
   }} catch (e) {{}}
 }}
 function showFillBanner(f) {{
+  if (isMuted()) return;
   const container = document.getElementById('fill-banners');
   if (!container) return;
   const el = document.createElement('div');
@@ -527,32 +546,20 @@ async function dropReprice(evt, product, price) {{
   await trade(product, side, price, qty);
 }}
 </script>
-<div class="topbar">{nav}<div id="account-bar"></div></div>
+<div class="topbar">{nav}<div style="display:flex; align-items:center; gap:14px;"><button id="mute-btn" onclick="toggleMute()"></button><div id="account-bar"></div></div></div>
 <div id="fill-banners"></div>
-<script>renderAccountBar();</script>
+<script>renderAccountBar(); renderMuteButton();</script>
 {body}
 </body>
 </html>"""
 
 
-def create_website_app(state: AppState) -> FastAPI:
-    app = FastAPI(title="Mini-Exchange Website")
-
-    nav = (
-        '<nav><a href="/">Order Books</a><a href="/leaderboard">Leaderboard</a>'
-        '<a href="/portfolio">Portfolio</a>'
-        f'<a href="{state.config.network.admin_api_base_url}/" target="_blank">Admin</a></nav>'
-    )
-
-    def page(body: str) -> str:
-        return PAGE_TEMPLATE.format(nav=nav, body=body, api_base_url=state.config.network.api_base_url)
-
-    @app.get("/", response_class=HTMLResponse)
-    def order_books():
-        cols = ""
-        for product, cfg in state.config.products.items():
-            tick = cfg.tick_size
-            cols += f"""
+def _ladder_block(product: str, tick: float) -> str:
+    """One product's order-book column: metrics, chart, and click/drag-to-
+    trade ladder. Factored out of order_books() so the Spread Matrix page
+    can render the exact same widget for a single instrument instead of
+    duplicating ~250 lines of ladder JS."""
+    return f"""
 <div class="col">
 <h2>{product}</h2>
 <div class="metrics" id="metrics-{product}"></div>
@@ -844,7 +851,100 @@ def create_website_app(state: AppState) -> FastAPI:
 }})();
 </script>
 """
+
+
+def create_website_app(state: AppState) -> FastAPI:
+    app = FastAPI(title="Mini-Exchange Website")
+
+    nav = (
+        '<nav><a href="/">Order Books</a><a href="/options">Options Chain</a>'
+        '<a href="/spread">Spread Matrix</a><a href="/leaderboard">Leaderboard</a>'
+        '<a href="/portfolio">Portfolio</a>'
+        f'<a href="{state.config.network.admin_api_base_url}/" target="_blank">Admin</a></nav>'
+    )
+
+    def page(body: str) -> str:
+        return PAGE_TEMPLATE.format(nav=nav, body=body, api_base_url=state.config.network.api_base_url)
+
+    @app.get("/", response_class=HTMLResponse)
+    def order_books():
+        cols = ""
+        for product, cfg in state.config.products.items():
+            cols += _ladder_block(product, cfg.tick_size)
         return page(f'<div class="cols">{cols}</div>')
+
+    @app.get("/spread", response_class=HTMLResponse)
+    def spread_matrix():
+        symbol = state.config.spread.symbol
+        if not state.spread_enabled:
+            banner = (
+                f'<p class="meta">The {symbol} spread instrument is currently disabled by the admin. '
+                "The book below will populate once it's re-enabled.</p>"
+            )
+        else:
+            banner = ""
+        tick = state.config.spread.tick_size
+        return page(f"<h2>Spread Matrix</h2>{banner}" + f'<div class="cols">{_ladder_block(symbol, tick)}</div>')
+
+    @app.get("/options", response_class=HTMLResponse)
+    def options_chain():
+        contracts = sorted(state.options_manager.chain.values(), key=lambda o: (o.strike, o.option_type))
+        if not contracts:
+            body = (
+                "<h2>Options Chain</h2>"
+                '<p class="meta">No active chain right now'
+                + ("." if state.options_enabled else " — 15-min BTC options are currently disabled by the admin.")
+                + "</p>"
+            )
+            return page(body)
+        expiry_ts = contracts[0].expiry_ts
+        strikes = sorted({o.strike for o in contracts})
+        rows = "".join(
+            f'<tr><td>{strike:.2f}</td>'
+            f'<td id="opt-call-{strike:.2f}"></td>'
+            f'<td id="opt-put-{strike:.2f}"></td></tr>'
+            for strike in strikes
+        )
+        body = f"""
+<h2>Options Chain</h2>
+<p class="meta">Underlying {state.config.options.underlying} &middot; expiry <span id="opt-expiry"></span></p>
+<table><thead><tr><th>Strike</th><th>Call (theo / bid / ask)</th><th>Put (theo / bid / ask)</th></tr></thead>
+<tbody>{rows}</tbody></table>
+<script>
+function renderOptionCell(id, c) {{
+  const el = document.getElementById(id);
+  if (!el || !c) return;
+  const fmt = (v) => v === null || v === undefined ? 'n/a' : v.toFixed(2);
+  el.textContent = `${{fmt(c.theo)}} / ${{fmt(c.bid)}} / ${{fmt(c.ask)}}`;
+}}
+poll('/data/options', (d) => {{
+  document.getElementById('opt-expiry').textContent = d.expiry_ts
+    ? new Date(d.expiry_ts * 1000).toLocaleTimeString() : 'n/a';
+  for (const c of d.contracts) {{
+    renderOptionCell('opt-' + c.option_type + '-' + c.strike.toFixed(2), c);
+  }}
+}}, 1000);
+</script>
+"""
+        return page(body)
+
+    @app.get("/data/options")
+    def data_options():
+        now = time.time()
+        contracts = []
+        expiry_ts = None
+        for opt in state.options_manager.chain.values():
+            expiry_ts = opt.expiry_ts
+            book = state.engine.book_snapshot(opt.symbol, depth=1)
+            contracts.append({
+                "symbol": opt.symbol,
+                "strike": opt.strike,
+                "option_type": opt.option_type,
+                "theo": state.index_service.get_index_price(opt.symbol, now),
+                "bid": book["bids"][0]["price"] if book["bids"] else None,
+                "ask": book["asks"][0]["price"] if book["asks"] else None,
+            })
+        return {"expiry_ts": expiry_ts, "contracts": contracts}
 
     @app.get("/leaderboard", response_class=HTMLResponse)
     def leaderboard_page():
@@ -924,7 +1024,7 @@ loadPortfolio();
 
     @app.get("/data/book/{product}")
     def data_book(product: str):
-        if product not in state.config.products:
+        if product not in state.engine.products:
             raise HTTPException(status_code=404, detail="unknown product")
         return state.market_snapshot(product)
 
