@@ -67,6 +67,7 @@ class AppState:
             contract_size=config.spread.contract_size,
             max_position=config.spread.max_position,
             tick_size=config.spread.tick_size,
+            allow_negative_price=True,
         )
         self.engine.add_product(spread_cfg)
         self.index_service.add_product(spread_cfg)

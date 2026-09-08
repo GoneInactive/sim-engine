@@ -79,6 +79,22 @@ PAGE_TEMPLATE = """<!doctype html>
   .ladder td.last-sell {{ background:#ffb3b3 !important; }}
   .ladder tbody tr:hover td {{ filter:brightness(0.96); }}
   .ladder-scroll {{ overflow-y:auto; border:1px solid #000; }}
+  .chain-underlying {{ font-size:20px; font-weight:700; margin:4px 0 16px; }}
+  .chain-underlying span {{ color:#0a7d2c; }}
+  .chain-table {{ border-collapse:collapse; width:auto; }}
+  .chain-table th, .chain-table td {{ text-align:center; padding:4px 14px; border-bottom:1px solid #ddd; font-size:13px; }}
+  .chain-table thead tr.group th {{ border-bottom:1px solid #000; font-size:11px; letter-spacing:0.06em; text-transform:uppercase; color:#555; }}
+  .chain-table th.strike-col, .chain-table td.strike-col {{ font-weight:700; border-left:1px solid #000; border-right:1px solid #000; background:#f6f6f6; }}
+  .chain-table td.call-cell, .chain-table td.put-cell {{ cursor:pointer; }}
+  .chain-table td.call-cell:hover, .chain-table td.put-cell:hover {{ background:#eef3ff; }}
+  .chain-positions {{ margin-top:20px; max-width:640px; }}
+  .chain-sidebar {{ position:fixed; top:0; right:0; width:480px; max-width:92vw; height:100vh;
+    background:#fff; border-left:1px solid #000; box-shadow:-6px 0 20px rgba(0,0,0,0.15);
+    transform:translateX(100%); transition:transform 0.2s ease; z-index:2000; display:flex; flex-direction:column; }}
+  .chain-sidebar.open {{ transform:translateX(0); }}
+  .chain-sidebar-head {{ display:flex; justify-content:space-between; align-items:center; padding:8px 12px; border-bottom:1px solid #000; flex-shrink:0; }}
+  .chain-sidebar-head button {{ background:#fff; color:#000; }}
+  .chain-sidebar iframe {{ flex:1; border:none; width:100%; }}
 </style>
 </head>
 <body>
@@ -897,39 +913,103 @@ def create_website_app(state: AppState) -> FastAPI:
                 + "</p>"
             )
             return page(body)
-        expiry_ts = contracts[0].expiry_ts
         strikes = sorted({o.strike for o in contracts})
         rows = "".join(
-            f'<tr><td>{strike:.2f}</td>'
-            f'<td id="opt-call-{strike:.2f}"></td>'
-            f'<td id="opt-put-{strike:.2f}"></td></tr>'
+            f'<tr>'
+            f'<td class="call-cell" id="opt-call-bid-{strike:.2f}" onclick="cellClick(this)"></td>'
+            f'<td class="call-cell" id="opt-call-theo-{strike:.2f}" onclick="cellClick(this)"></td>'
+            f'<td class="call-cell" id="opt-call-ask-{strike:.2f}" onclick="cellClick(this)"></td>'
+            f'<td class="strike-col">{strike:.2f}</td>'
+            f'<td class="put-cell" id="opt-put-bid-{strike:.2f}" onclick="cellClick(this)"></td>'
+            f'<td class="put-cell" id="opt-put-theo-{strike:.2f}" onclick="cellClick(this)"></td>'
+            f'<td class="put-cell" id="opt-put-ask-{strike:.2f}" onclick="cellClick(this)"></td>'
+            f'</tr>'
             for strike in strikes
         )
         body = f"""
 <h2>Options Chain</h2>
-<p class="meta">Underlying {state.config.options.underlying} &middot; expiry <span id="opt-expiry"></span></p>
-<table><thead><tr><th>Strike</th><th>Call (theo / bid / ask)</th><th>Put (theo / bid / ask)</th></tr></thead>
-<tbody>{rows}</tbody></table>
+<div class="chain-underlying">{state.config.options.underlying} <span id="chain-underlying-price">...</span></div>
+<p class="meta">expiry <span id="opt-expiry"></span> &middot; click any Bid/Theo/Ask cell to open that contract's ladder</p>
+<div style="overflow-x:auto;">
+<table class="chain-table">
+<thead>
+<tr class="group"><th colspan="3">Calls</th><th></th><th colspan="3">Puts</th></tr>
+<tr><th>Bid</th><th>Theo</th><th>Ask</th><th class="strike-col">Strike</th><th>Bid</th><th>Theo</th><th>Ask</th></tr>
+</thead>
+<tbody>{rows}</tbody>
+</table>
+</div>
+
+<div class="chain-positions">
+<h2>Your option positions</h2>
+<table><thead><tr><th>Contract</th><th>Qty</th><th>Avg cost</th></tr></thead>
+<tbody id="chain-positions-body"><tr><td colspan="3">log in above to see your positions</td></tr></tbody></table>
+</div>
+
+<div id="chain-sidebar" class="chain-sidebar">
+  <div class="chain-sidebar-head">
+    <strong id="chain-sidebar-title"></strong>
+    <button onclick="closeLadder()">&times; Close</button>
+  </div>
+  <iframe id="chain-sidebar-frame" src="about:blank"></iframe>
+</div>
+
 <script>
-function renderOptionCell(id, c) {{
-  const el = document.getElementById(id);
-  if (!el || !c) return;
-  const fmt = (v) => v === null || v === undefined ? 'n/a' : v.toFixed(2);
-  el.innerHTML = `<a href="/options/${{encodeURIComponent(c.symbol)}}">${{fmt(c.theo)}} / ${{fmt(c.bid)}} / ${{fmt(c.ask)}}</a>`;
+let chainContractSymbols = new Set();
+
+function openLadder(symbol) {{
+  document.getElementById('chain-sidebar-title').textContent = symbol;
+  document.getElementById('chain-sidebar-frame').src = '/options/' + encodeURIComponent(symbol) + '?embed=1';
+  document.getElementById('chain-sidebar').classList.add('open');
+}}
+function closeLadder() {{
+  document.getElementById('chain-sidebar').classList.remove('open');
+  document.getElementById('chain-sidebar-frame').src = 'about:blank';
+}}
+function cellClick(el) {{
+  if (el.dataset.symbol) openLadder(el.dataset.symbol);
+}}
+function renderOptionCell(strike, side, c) {{
+  const fmt = (v) => v === null || v === undefined ? '—' : v.toFixed(2);
+  for (const field of ['bid', 'theo', 'ask']) {{
+    const el = document.getElementById('opt-' + side + '-' + field + '-' + strike.toFixed(2));
+    if (!el) continue;
+    el.textContent = fmt(c[field]);
+    el.dataset.symbol = c.symbol;
+  }}
+}}
+async function renderChainPositions() {{
+  const account = await getAccount();
+  const tbody = document.getElementById('chain-positions-body');
+  if (!tbody) return;
+  if (!account) {{
+    tbody.innerHTML = '<tr><td colspan="3">log in above to see your positions</td></tr>';
+    return;
+  }}
+  const rows = Object.entries(account.positions).filter(([sym]) => chainContractSymbols.has(sym));
+  tbody.innerHTML = rows.length
+    ? rows.map(([sym, pos]) => `<tr><td>${{sym}}</td><td>${{pos.qty}}</td><td>$${{pos.avg_cost.toFixed(2)}}</td></tr>`).join('')
+    : '<tr><td colspan="3">no open option positions</td></tr>';
 }}
 poll('/data/options', (d) => {{
   document.getElementById('opt-expiry').textContent = d.expiry_ts
     ? new Date(d.expiry_ts * 1000).toLocaleTimeString() : 'n/a';
+  const priceEl = document.getElementById('chain-underlying-price');
+  if (priceEl) priceEl.textContent = (d.underlying_price === null || d.underlying_price === undefined)
+    ? 'n/a' : '$' + d.underlying_price.toFixed(2);
+  chainContractSymbols = new Set(d.contracts.map(c => c.symbol));
   for (const c of d.contracts) {{
-    renderOptionCell('opt-' + c.option_type + '-' + c.strike.toFixed(2), c);
+    renderOptionCell(c.strike, c.option_type, c);
   }}
+  renderChainPositions();
 }}, 1000);
+window.onLogin = renderChainPositions;
 </script>
 """
         return page(body)
 
     @app.get("/options/{symbol}", response_class=HTMLResponse)
-    def option_ladder(symbol: str):
+    def option_ladder(symbol: str, embed: bool = False):
         opt = state.options_manager.chain.get(symbol)
         if opt is None:
             body = (
@@ -941,11 +1021,18 @@ poll('/data/options', (d) => {{
         header = (
             f'<h2>{symbol}</h2>'
             f'<p class="meta">{opt.option_type.upper()} &middot; strike {opt.strike:.2f} &middot; '
-            f'expiry {time.strftime("%H:%M:%S UTC", time.gmtime(opt.expiry_ts))} &middot; '
-            '<a href="/options">Back to Options Chain</a></p>'
+            f'expiry {time.strftime("%H:%M:%S UTC", time.gmtime(opt.expiry_ts))}'
+            + ("" if embed else ' &middot; <a href="/options">Back to Options Chain</a>')
+            + "</p>"
         )
         tick = state.config.options.tick_size
-        return page(header + f'<div class="cols">{_ladder_block(symbol, tick)}</div>')
+        content = header + f'<div class="cols">{_ladder_block(symbol, tick)}</div>'
+        if embed:
+            # Opened inside the chain page's slide-in sidebar — the full nav
+            # bar just wastes width in a 480px panel; the account bar stays
+            # (same localStorage session, same origin) since trading needs it.
+            content = "<style>.topbar nav{display:none} body{padding:10px}</style>" + content
+        return page(content)
 
     @app.get("/data/options")
     def data_options():
@@ -963,7 +1050,8 @@ poll('/data/options', (d) => {{
                 "bid": book["bids"][0]["price"] if book["bids"] else None,
                 "ask": book["asks"][0]["price"] if book["asks"] else None,
             })
-        return {"expiry_ts": expiry_ts, "contracts": contracts}
+        underlying_price = state.index_service.get_index_price(state.config.options.underlying, now)
+        return {"expiry_ts": expiry_ts, "contracts": contracts, "underlying_price": underlying_price}
 
     @app.get("/leaderboard", response_class=HTMLResponse)
     def leaderboard_page():

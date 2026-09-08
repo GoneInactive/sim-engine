@@ -46,6 +46,11 @@ class ProductConfig:
     starting_price: float = 75.0
     annual_volatility: float = 0.6
     annual_drift: float = 0.0
+    # Only the BTC-ETH spread instrument sets this — btc_index - eth_index
+    # is designed to legitimately cross zero (an admin "invert" event
+    # flips its sign on purpose). Every other product is a real underlying
+    # price and should stay positive.
+    allow_negative_price: bool = False
 
 
 @dataclass(frozen=True)

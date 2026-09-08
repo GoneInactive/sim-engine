@@ -203,7 +203,7 @@ class MatchingEngine:
         if type_ is OrderType.LIMIT:
             if price is None:
                 raise OrderRejected("limit order requires a price")
-            if price <= 0:
+            if price <= 0 and not self.products[product].allow_negative_price:
                 # Nothing upstream validated this — a single bad price (a
                 # buggy student notebook script, a malformed direct API
                 # call, anything bypassing the website's own click-driven
@@ -211,6 +211,11 @@ class MatchingEngine:
                 # website's ladder centers itself on the book's own mid
                 # with no sanity bound, it would then center on garbage and
                 # every subsequent click would reinforce it further.
+                #
+                # The BTC-ETH spread instrument is the one legitimate
+                # exception (see ProductConfig.allow_negative_price) — its
+                # fair value is btc_index - eth_index, which an "invert"
+                # event deliberately pushes negative.
                 raise OrderRejected(f"price must be positive, got {price}")
             tick_size = self.products[product].tick_size
             ticks = price / tick_size
