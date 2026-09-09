@@ -45,7 +45,7 @@ import requests
 from requests.adapters import HTTPAdapter
 
 BASE_URL: str = "http://178.105.55.5:8000"
-ACCOUNT_ID: str = "Optiver"
+ACCOUNT_ID: str = "dummytrader"
 PASSWORD: str = "poop"
 
 UNDERLYING: str = "BTC-MINI"

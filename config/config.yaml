@@ -56,7 +56,7 @@ products:
   BTC-MINI:
     underlying: "BTC/USD"
     contract_size: 0.001
-    max_position: 15
+    max_position: 150
     tick_size: 0.10
     # Underlying (pre contract-size-scaling) starting price and annualized
     # GBM volatility/drift driving the synthetic index (see synthetic_feed
@@ -67,7 +67,7 @@ products:
   ETH-MINI:
     underlying: "ETH/USD"
     contract_size: 0.03
-    max_position: 75
+    max_position: 150
     tick_size: 0.10
     starting_price: 2430.0
     annual_volatility: 0.70
@@ -85,7 +85,7 @@ spread:
   btc_product: "BTC-MINI"
   eth_product: "ETH-MINI"
   contract_size: 1.0
-  max_position: 75
+  max_position: 250
   tick_size: 0.10
 
 # 15-minute European BTC options. A fresh strike chain (calls + puts around
@@ -103,7 +103,7 @@ spread:
 options:
   enabled_default: false
   underlying: "BTC-MINI"
-  window_seconds: 900
+  window_seconds: 600
   strikes_each_side: 5
   strike_increment: 1.0
   implied_volatility: 0.55
@@ -112,7 +112,7 @@ options:
   # itself multiplies by contract_size again — anything but 1.0 here
   # silently rescales every option's price a second time.
   contract_size: 1.0
-  max_position: 15
+  max_position: 75
   # A 15-minute option's extrinsic value is genuinely tiny in this
   # contract-scaled price space (BS time value ~$0.09 even ATM, per
   # build/verification notes) — a coarser tick would round most of the
@@ -131,15 +131,15 @@ feed:
   shock_decay_seconds: 7
 
 rate_limit:
-  requests_per_second: 20
-  burst: 40
-  ws_connections_per_key: 1
+  requests_per_second: 100
+  burst: 400
+  ws_connections_per_key: 10
 
 fees:
   # Applied to every fill's notional (price * qty), on both sides. Negative
   # maker_bps is a rebate (maker gets paid to add liquidity); positive
   # taker_bps is a cost (taker pays to take liquidity).
-  maker_bps: -1.0
+  maker_bps: -2.0
   taker_bps: 2.0
 
 admin:
