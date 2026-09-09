@@ -35,8 +35,10 @@ network:
     website_base_url: "http://178.105.55.5:8090"
 
 database:
-  # Local default; docker-compose overrides via DATABASE_URL env var.
-  url: "postgresql+asyncpg://sim_engine:sim_engine@127.0.0.1:5432/sim_engine"
+  # Local default; override via DATABASE_URL env var for other deployments.
+  # Port 5433, not Postgres's usual 5432 — that port on this box's own
+  # Postgres container already belongs to a different, unrelated service.
+  url: "postgresql+asyncpg://sim_engine:sim_engine@127.0.0.1:5433/sim_engine"
 
 # Index price is fully synthetic (no external feed — Kraken's live feed
 # proved too unreliable to depend on for a multi-day unattended run).
