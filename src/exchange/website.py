@@ -136,9 +136,14 @@ function clearSession() {{
 // channel that page needs (book/portfolio/leaderboard/chat/options)
 // instead of a separate polling timer per data type. Each page sets
 // window.__wsChannels (an array, e.g. ['book:BTC-MINI']) before this
-// connects — see the trailing <script>connectSocket()</script> placed
-// after the page content below, which runs only after every page-content
-// script has already run and had a chance to set that array. --------------
+// connects — see the trailing connectSocket() call placed in its own
+// script tag after the page content below, which runs only after every
+// page-content script has already run and had a chance to set that
+// array. NOTE: never write the literal characters '</script' inside any
+// comment or string in this file's inline JS — the HTML parser closes a
+// <script> element on that sequence regardless of JS-level context, which
+// silently truncates everything after it into plain visible page text
+// (exactly what happened here the first time). ------------------------
 let socket = null;
 let socketReconnectTimer = null;
 const channelCallbacks = {{}};
