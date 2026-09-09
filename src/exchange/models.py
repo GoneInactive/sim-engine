@@ -17,6 +17,20 @@ def next_fill_id() -> int:
     return next(_fill_id_counter)
 
 
+def advance_order_id_counter(past: int) -> None:
+    """Fast-forwards the order-id counter so newly created orders never
+    collide with ids restored from persistence on boot. `past` is the
+    highest id already seen (e.g. from a replayed table) — safe to call
+    with 0 if nothing was restored."""
+    global _order_id_counter
+    _order_id_counter = itertools.count(past + 1)
+
+
+def advance_fill_id_counter(past: int) -> None:
+    global _fill_id_counter
+    _fill_id_counter = itertools.count(past + 1)
+
+
 class Side(str, Enum):
     BUY = "buy"
     SELL = "sell"

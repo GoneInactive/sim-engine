@@ -61,7 +61,7 @@ class Config:
     PRODUCTS = ("BTC-MINI", "ETH-MINI")
 
     HISTORY_CSV: Path = Path(__file__).resolve().parent / "data" / "btc_eth_sample.csv"
-    ENTRY_Z: float = 4.0
+    ENTRY_Z: float = 3.0
     EXIT_Z: float = 0.5
     TARGET_QTY: int = 75         # contracts per leg, clamped to live MAX_POSITION headroom regardless
 

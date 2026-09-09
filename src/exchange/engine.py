@@ -19,6 +19,7 @@ import bisect
 import itertools
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 from . import ledger
 from .config import ProductConfig
@@ -110,7 +111,23 @@ def _crosses(taker_side: Side, taker_price: float | None, maker_price: float) ->
 
 
 class MatchingEngine:
-    def __init__(self, products: dict[str, ProductConfig], maker_fee_bps: float = -1.0, taker_fee_bps: float = 2.0):
+    def __init__(
+        self,
+        products: dict[str, ProductConfig],
+        maker_fee_bps: float = -1.0,
+        taker_fee_bps: float = 2.0,
+        on_fill: Callable[[Fill], None] | None = None,
+        on_order: Callable[[Order], None] | None = None,
+    ):
+        # Optional persistence hooks (default no-op) — called at the exact
+        # points a Fill/Order is created or has its status change, so a
+        # caller can durably log every state-changing event without this
+        # module knowing anything about how or where it's stored. This is
+        # the single chokepoint for *every* fill regardless of origin
+        # (student order, MM bot, arb bot correction) since a bot-vs-
+        # student fill still moves a real student's cash.
+        self._on_fill = on_fill
+        self._on_order = on_order
         # Copied, not aliased: add_product/remove_product mutate this dict
         # at runtime (dynamic option contracts, the spread instrument), and
         # must never leak those changes back into the caller's own dict —
@@ -273,6 +290,8 @@ class MatchingEngine:
                 if order.status is OrderStatus.OPEN:
                     order.status = OrderStatus.CANCELLED
                 order.remaining_qty = 0
+        if self._on_order is not None:
+            self._on_order(order)
         return order
 
     def cancel_order(self, order_id: int, account_id: str) -> Order:
@@ -286,6 +305,8 @@ class MatchingEngine:
         self.books[order.product].remove(order)
         order.status = OrderStatus.CANCELLED
         self._remove_resting(order)
+        if self._on_order is not None:
+            self._on_order(order)
         return order
 
     def kill_account_orders(self, account_id: str) -> list[Order]:
@@ -296,6 +317,8 @@ class MatchingEngine:
                 order.status = OrderStatus.CANCELLED
                 self._remove_resting(order)
                 killed.append(order)
+                if self._on_order is not None:
+                    self._on_order(order)
         return killed
 
     # -- matching ---------------------------------------------------------
@@ -341,6 +364,8 @@ class MatchingEngine:
                 self.fills_by_account.setdefault(fill.taker_account_id, []).append(fill)
             self.volume_qty[taker.product] += fill_qty
             self.volume_notional[taker.product] += notional
+            if self._on_fill is not None:
+                self._on_fill(fill)
 
             if maker.remaining_qty == 0:
                 maker.status = OrderStatus.FILLED
@@ -348,12 +373,50 @@ class MatchingEngine:
                 self._remove_resting(maker)
             else:
                 maker.status = OrderStatus.PARTIALLY_FILLED
+            # The maker's own status just changed but submit_order (which
+            # only sees the taker) won't emit it — this is the only place
+            # that ever happens, so it must fire here.
+            if self._on_order is not None:
+                self._on_order(maker)
 
         if taker.remaining_qty == 0:
             taker.status = OrderStatus.FILLED
         elif taker.remaining_qty < taker.qty:
             taker.status = OrderStatus.PARTIALLY_FILLED
         # else: still OPEN (limit) — caller rests it if applicable
+
+    def settle_fill(
+        self, account_id: str, product: str, side: Side, qty: int, price: float, now: float | None = None
+    ) -> Fill:
+        """One-sided settlement (e.g. an option's cash settlement at
+        expiry) — no counterparty and no fee, since it isn't a real
+        market trade, just the ledger's existing close-PnL rule applied
+        directly. Still produces a real Fill row (maker/taker both set to
+        the settling account) so it shows up in that account's /fills
+        history and goes through the same on_fill persistence hook as
+        every other fill, instead of silently mutating cash with nothing
+        to show for it afterward."""
+        account = self.accounts[account_id]
+        ledger.apply_fill(account, product, side, qty, price)
+        fill = Fill(
+            id=next_fill_id(),
+            product=product,
+            price=price,
+            qty=qty,
+            timestamp=now if now is not None else time.time(),
+            maker_order_id=0,
+            taker_order_id=0,
+            maker_account_id=account_id,
+            taker_account_id=account_id,
+            taker_side=side,
+        )
+        self.trade_tape.append(fill)
+        self.fills_by_account.setdefault(account_id, []).append(fill)
+        self.volume_qty[product] = self.volume_qty.get(product, 0) + qty
+        self.volume_notional[product] = self.volume_notional.get(product, 0.0) + price * qty
+        if self._on_fill is not None:
+            self._on_fill(fill)
+        return fill
 
     def book_snapshot(self, product: str, depth: int = 10) -> dict:
         return self.books[product].snapshot(depth)

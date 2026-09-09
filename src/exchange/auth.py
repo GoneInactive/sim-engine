@@ -59,6 +59,26 @@ class AuthStore:
         self.by_key[record.key] = record
         return record
 
+    def restore_record(
+        self,
+        account_id: str,
+        api_key: str,
+        active: bool,
+        password_salt: bytes | None,
+        password_hash: bytes | None,
+    ) -> ApiKeyRecord:
+        """Boot-time replay only: rehydrates a record with its *exact*
+        prior key/hash (unlike every other method here, which always mints
+        a fresh key) — a restart must not silently change what a student's
+        password or already-deployed API key resolves to."""
+        record = ApiKeyRecord(
+            key=api_key, account_id=account_id, active=active,
+            password_salt=password_salt, password_hash=password_hash,
+        )
+        self.by_account[account_id] = record
+        self.by_key[api_key] = record
+        return record
+
     def issue_key(self, account_id: str) -> ApiKeyRecord:
         existing = self.by_account.get(account_id)
         if existing is not None:

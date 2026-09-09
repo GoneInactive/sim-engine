@@ -35,6 +35,10 @@ class LoginIn(BaseModel):
     password: str
 
 
+class ChatIn(BaseModel):
+    text: str
+
+
 def create_public_app(state: AppState) -> FastAPI:
     app = FastAPI(title="Mini-Exchange Public API")
     limiter = TokenBucketLimiter(state.config.rate_limit.requests_per_second, state.config.rate_limit.burst)
@@ -176,6 +180,13 @@ def create_public_app(state: AppState) -> FastAPI:
     @app.get("/leaderboard")
     def get_leaderboard():
         return state.leaderboard()
+
+    @app.post("/chat")
+    def post_chat(body: ChatIn, auth: ApiKeyRecord = Depends(auth_dep)):
+        try:
+            return state.post_chat_message(auth.account_id, body.text)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
     return app
 

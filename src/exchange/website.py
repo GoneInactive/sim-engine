@@ -875,7 +875,7 @@ def create_website_app(state: AppState) -> FastAPI:
     nav = (
         '<nav><a href="/">Order Books</a><a href="/options">Options Chain</a>'
         '<a href="/spread">Spread Matrix</a><a href="/leaderboard">Leaderboard</a>'
-        '<a href="/portfolio">Portfolio</a>'
+        '<a href="/portfolio">Portfolio</a><a href="/chat">Chat</a>'
         f'<a href="{state.config.network.admin_api_base_url}/" target="_blank">Admin</a></nav>'
     )
 
@@ -1169,6 +1169,65 @@ async function flattenAllPositions() {
 """
         return page(body)
 
+    @app.get("/chat", response_class=HTMLResponse)
+    def chat_page():
+        body = """
+<h2>Chat</h2>
+<div id="chat-log" style="border:1px solid #000; height:420px; overflow-y:auto; padding:8px; font-size:13px; margin-bottom:8px;"></div>
+<div style="display:flex; gap:8px;">
+  <input id="chat-input" placeholder="message" style="flex:1;" maxlength="300"
+         onkeydown="if (event.key === 'Enter') sendChat();">
+  <button onclick="sendChat()">Send</button>
+</div>
+<div id="chat-msg" class="meta"></div>
+<script>
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+let lastRenderedChatId = null;
+function renderChatLog(messages) {
+  const log = document.getElementById('chat-log');
+  const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 20;
+  log.innerHTML = messages.map(m =>
+    `<div><span style="color:#666;">${new Date(m.timestamp * 1000).toLocaleTimeString()}</span> ` +
+    `<b>${escapeHtml(m.account_id)}</b>: ${escapeHtml(m.text)}</div>`
+  ).join('');
+  const newestId = messages.length ? messages[messages.length - 1].id : null;
+  if (atBottom || lastRenderedChatId === null || newestId !== lastRenderedChatId) {
+    log.scrollTop = log.scrollHeight;
+  }
+  lastRenderedChatId = newestId;
+}
+poll('/data/chat', renderChatLog, 1500);
+
+async function sendChat() {
+  const key = getKey();
+  const msgEl = document.getElementById('chat-msg');
+  if (!key) { msgEl.innerHTML = '<span class="err">log in above to chat</span>'; return; }
+  const input = document.getElementById('chat-input');
+  const text = input.value.trim();
+  if (!text) return;
+  try {
+    const r = await fetch(API_BASE + '/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-API-Key': key},
+      body: JSON.stringify({text}),
+    });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      msgEl.innerHTML = `<span class="err">${d.detail || r.status}</span>`;
+      return;
+    }
+    msgEl.innerHTML = '';
+    input.value = '';
+  } catch (e) {
+    msgEl.innerHTML = `<span class="err">${e.message}</span>`;
+  }
+}
+</script>
+"""
+        return page(body)
+
     @app.get("/data/book/{product}")
     def data_book(product: str):
         if product not in state.engine.products:
@@ -1178,6 +1237,15 @@ async function flattenAllPositions() {
     @app.get("/data/leaderboard")
     def data_leaderboard():
         return state.leaderboard()
+
+    @app.get("/data/chat")
+    def data_chat():
+        # Read-only and unauthenticated (same-origin, in-process AppState
+        # read) — same pattern as /data/leaderboard. Sending a message
+        # still requires a real login: that goes straight to the public
+        # API's POST /chat with the student's own X-API-Key, same as
+        # placing an order, so a message is always attributable.
+        return list(state.chat_messages)
 
     @app.post("/data/register")
     def data_register(body: RegisterIn):

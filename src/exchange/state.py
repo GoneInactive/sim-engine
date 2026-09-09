@@ -3,14 +3,18 @@ IndexPriceService, one BotManager, one AuthStore — built once and handed to
 all three FastAPI apps (public, admin, website) so they operate on the same
 live state without a network hop between them.
 
-Persistence to Postgres (build-spec.md §11) is deferred until this moves
-off a single dev machine; for now, all state is in-memory and does not
-survive a process restart.
+Durable storage (build-spec.md §11) lives in persistence.py — this class
+takes an optional PersistenceLog and, when given one, wires it into the
+engine's on_fill/on_order hooks and calls it from every other
+state-changing chokepoint (register/issue-key/chat). Without one (e.g. in
+tests), everything behaves exactly as it always did: in-memory only.
 """
 from __future__ import annotations
 
+import itertools
 import time
 from collections import deque
+from typing import TYPE_CHECKING
 
 from .auth import AccountExistsError, AuthStore
 from .bots import BotManager
@@ -20,15 +24,28 @@ from .index_feed import IndexPriceService
 from .ledger import equity, unrealized_pnl
 from .options import OptionsChainManager, next_boundary
 
+if TYPE_CHECKING:
+    from .persistence import PersistenceLog
+
 PRICE_HISTORY_LEN = 120
 ADMIN_TRADING_ACCOUNT_ID = "admin"
 ADMIN_TRADING_STARTING_CASH = 1_000_000.0
+CHAT_HISTORY_LEN = 200
+CHAT_MAX_LEN = 300
+
+
+def _is_bot_account(account_id: str) -> bool:
+    return account_id.startswith("mm_") or account_id.startswith("noise_") or account_id.startswith("arb_")
 
 
 class AppState:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, persistence_log: "PersistenceLog | None" = None):
         self.config = config
-        self.engine = MatchingEngine(config.products, config.fees.maker_bps, config.fees.taker_bps)
+        self.persistence_log = persistence_log
+        self.engine = MatchingEngine(
+            config.products, config.fees.maker_bps, config.fees.taker_bps,
+            on_fill=self._on_fill, on_order=self._on_order,
+        )
         self.index_service = IndexPriceService(config.feed, config.products)
         self.bot_manager = BotManager(self.engine, self.index_service, config.accounts.starting_cash)
         self.bot_manager.spawn_defaults(list(config.products.keys()))
@@ -83,6 +100,51 @@ class AppState:
         if self.options_enabled:
             now = time.time()
             self.options_manager.create_chain(now, next_boundary(now, config.options.window_seconds))
+
+        # -- global chat ---------------------------------------------------
+        # One shared room, everyone with an account can post — durable via
+        # persistence_log when one is configured (see persistence.py).
+        self.chat_messages: deque[dict] = deque(maxlen=CHAT_HISTORY_LEN)
+        self._next_chat_id = itertools.count(1)
+
+    # -- persistence hooks, wired into MatchingEngine above -----------------
+    def _on_fill(self, fill) -> None:
+        if self.persistence_log is None:
+            return
+        # settle_fill uses id 0 for both order ids (there's no real
+        # counterparty order for a settlement) — that's the signal this
+        # fill never had a fee charged, distinct from "0 bps" which is a
+        # real, deliberately-zero fee rate.
+        is_settlement = fill.maker_order_id == 0 and fill.taker_order_id == 0
+        maker_fee_bps = None if is_settlement else self.engine.maker_fee_bps
+        taker_fee_bps = None if is_settlement else self.engine.taker_fee_bps
+        self.persistence_log.log_fill(fill, maker_fee_bps, taker_fee_bps)
+
+    def _on_order(self, order) -> None:
+        # Fills are always logged (a bot-vs-student fill still moves a
+        # real student's cash — see _on_fill), but a bot's own resting
+        # orders are pure system noise: bot accounts are never restored,
+        # so their order rows would just accumulate unboundedly over a
+        # long-running session for nothing.
+        if self.persistence_log is not None and not _is_bot_account(order.account_id):
+            self.persistence_log.log_order(order)
+
+    def post_chat_message(self, account_id: str, text: str) -> dict:
+        text = text.strip()
+        if not text:
+            raise ValueError("message is empty")
+        if len(text) > CHAT_MAX_LEN:
+            text = text[:CHAT_MAX_LEN]
+        message = {
+            "id": next(self._next_chat_id),
+            "account_id": account_id,
+            "text": text,
+            "timestamp": time.time(),
+        }
+        self.chat_messages.append(message)
+        if self.persistence_log is not None:
+            self.persistence_log.log_chat(message)
+        return message
 
     def _set_bots_active(self, product: str, active: bool) -> None:
         for bot in self.bot_manager.mm_bots:
@@ -185,12 +247,21 @@ class AppState:
             params["annual_drift"] = annual_drift
         return params
 
+    def _log_account_and_credentials(self, account_id: str, starting_cash: float, record) -> None:
+        if self.persistence_log is None:
+            return
+        self.persistence_log.log_account(account_id, starting_cash)
+        self.persistence_log.log_credentials(
+            account_id, record.key, record.active, record.password_salt, record.password_hash,
+        )
+
     def register_student(self, account_id: str, password: str) -> str:
         """Self-serve registration: active immediately, no admin approval
         step. Deposits the starting cash on account creation."""
         self.engine.get_or_create_account(account_id, self.config.accounts.starting_cash)
         self.starting_cash_by_account.setdefault(account_id, self.config.accounts.starting_cash)
         record = self.auth.register(account_id, password)
+        self._log_account_and_credentials(account_id, self.config.accounts.starting_cash, record)
         return record.key
 
     def login_student(self, account_id: str, password: str) -> str | None:
@@ -203,6 +274,7 @@ class AppState:
         self.engine.get_or_create_account(account_id, self.config.accounts.starting_cash)
         self.starting_cash_by_account.setdefault(account_id, self.config.accounts.starting_cash)
         record = self.auth.issue_key(account_id)
+        self._log_account_and_credentials(account_id, self.config.accounts.starting_cash, record)
         return record.key
 
     def index_prices(self, now: float | None = None) -> dict[str, float]:
@@ -213,7 +285,7 @@ class AppState:
         prices = self.index_prices(now)
         rows = []
         for account_id, account in self.engine.accounts.items():
-            if account_id.startswith("mm_") or account_id.startswith("noise_") or account_id.startswith("arb_"):
+            if _is_bot_account(account_id):
                 continue  # bots don't show on the student leaderboard
             if account_id == ADMIN_TRADING_ACCOUNT_ID:
                 continue  # the house account isn't a student to rank against

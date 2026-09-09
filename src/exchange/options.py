@@ -2,11 +2,13 @@
 Black-Scholes and quoted by the existing MarketMakerBot machinery, so the
 matching engine, ledger, and bots need no option-specific logic at all.
 
-Cash settlement at expiry reuses ledger.apply_fill's existing "cash only
-moves on close" rule unchanged — force-closing a position at intrinsic
-value *is* exactly the right settlement, since realized PnL from that fill
-is qty * (intrinsic - avg_cost), the correct payoff for a long/short option
-position held to expiry.
+Cash settlement at expiry goes through MatchingEngine.settle_fill, which
+applies ledger.apply_fill's existing "cash only moves on close" rule —
+force-closing a position at intrinsic value *is* exactly the right
+settlement, since realized PnL from that fill is
+qty * (intrinsic - avg_cost), the correct payoff for a long/short option
+position held to expiry — and produces a real Fill row so it shows up in
+history and gets durably persisted like any other fill.
 """
 from __future__ import annotations
 
@@ -18,7 +20,6 @@ from .bots import BotManager
 from .config import OptionsConfig, ProductConfig
 from .engine import MatchingEngine, OrderRejected
 from .index_feed import IndexPriceService
-from .ledger import apply_fill
 from .models import Side
 
 SECONDS_PER_YEAR = 365.0 * 24 * 3600
@@ -148,7 +149,7 @@ class OptionsChainManager:
             if pos is None or pos.qty == 0:
                 continue
             closing_side = Side.SELL if pos.qty > 0 else Side.BUY
-            apply_fill(account, opt.symbol, closing_side, abs(pos.qty), settlement)
+            self.engine.settle_fill(account.id, opt.symbol, closing_side, abs(pos.qty), settlement, now)
 
         book = self.engine.books.get(opt.symbol)
         if book is not None:

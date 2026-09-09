@@ -133,6 +133,17 @@ def create_admin_app(state: AppState) -> FastAPI:
         )
 
     # -- account management ------------------------------------------------
+    def _log_credentials(record) -> None:
+        if state.persistence_log is not None:
+            state.persistence_log.log_credentials(
+                record.account_id, record.key, record.active, record.password_salt, record.password_hash,
+            )
+
+    def _log_frozen(account_id: str, frozen: bool) -> None:
+        if state.persistence_log is not None:
+            starting_cash = state.starting_cash_by_account.get(account_id, state.config.accounts.starting_cash)
+            state.persistence_log.log_account(account_id, starting_cash, frozen=frozen)
+
     @app.post("/accounts", dependencies=[Depends(admin_auth)])
     def register_account(body: RegisterIn):
         key = state.admin_issue_key(body.account_id)
@@ -144,6 +155,7 @@ def create_admin_app(state: AppState) -> FastAPI:
             record = state.auth.activate(key)
         except KeyError:
             raise HTTPException(status_code=404, detail="no such key")
+        _log_credentials(record)
         return {"account_id": record.account_id, "active": record.active}
 
     @app.post("/accounts/{key}/deactivate", dependencies=[Depends(admin_auth)])
@@ -152,6 +164,7 @@ def create_admin_app(state: AppState) -> FastAPI:
             record = state.auth.deactivate(key)
         except KeyError:
             raise HTTPException(status_code=404, detail="no such key")
+        _log_credentials(record)
         return {"account_id": record.account_id, "active": record.active}
 
     @app.post("/accounts/{account_id}/regenerate_key", dependencies=[Depends(admin_auth)])
@@ -159,6 +172,7 @@ def create_admin_app(state: AppState) -> FastAPI:
         if account_id not in state.engine.accounts:
             raise HTTPException(status_code=404, detail="no such account")
         record = state.auth.regenerate_key(account_id)
+        _log_credentials(record)
         return {"account_id": record.account_id, "api_key": record.key, "active": record.active}
 
     @app.post("/accounts/{account_id}/freeze", dependencies=[Depends(admin_auth)])
@@ -167,6 +181,7 @@ def create_admin_app(state: AppState) -> FastAPI:
         if account is None:
             raise HTTPException(status_code=404, detail="no such account")
         account.frozen = True
+        _log_frozen(account_id, True)
         return {"account_id": account_id, "frozen": True}
 
     @app.post("/accounts/{account_id}/unfreeze", dependencies=[Depends(admin_auth)])
@@ -175,6 +190,7 @@ def create_admin_app(state: AppState) -> FastAPI:
         if account is None:
             raise HTTPException(status_code=404, detail="no such account")
         account.frozen = False
+        _log_frozen(account_id, False)
         return {"account_id": account_id, "frozen": False}
 
     @app.get("/accounts/{account_id}/orders", dependencies=[Depends(admin_auth)])

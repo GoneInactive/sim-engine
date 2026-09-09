@@ -18,6 +18,7 @@ from .api_admin import create_admin_app
 from .api_public import create_public_app
 from .config import load_config
 from .options import OptionsScheduler
+from .persistence import PersistenceLog, ensure_schema, make_engine, replay_into
 from .state import AppState
 from .synthetic_feed import RandomEventScheduler, SyntheticFeedClient
 from .website import create_website_app
@@ -28,7 +29,21 @@ logger = logging.getLogger("exchange.app")
 
 async def main() -> None:
     config = load_config()
-    state = AppState(config)
+
+    # Durability is a hard requirement now, not a nice-to-have — fail
+    # fast and loud if Postgres isn't reachable rather than quietly
+    # falling back to in-memory-only and losing everything on the next
+    # restart without anyone noticing until it's too late.
+    db_engine = make_engine(config.database_url)
+    try:
+        await ensure_schema(db_engine)
+    except Exception as e:
+        logger.error("persistence: could not reach/initialize the database at startup: %s", e)
+        raise
+    persistence_log = PersistenceLog(db_engine)
+
+    state = AppState(config, persistence_log)
+    await replay_into(state, db_engine)
 
     public_app = create_public_app(state)
     admin_app = create_admin_app(state)
@@ -66,6 +81,7 @@ async def main() -> None:
         options_scheduler.run(),
         state.bot_manager.run_forever(),
         sample_price_history(),
+        persistence_log.drain_forever(),
     )
 
 
