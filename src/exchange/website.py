@@ -13,14 +13,18 @@ framing, per an explicit request to make the ladder tradable.
 Trading calls go straight from the browser to the public API's own origin
 (a different port), not through this backend, so CORS is enabled there
 (see api_public.py) rather than proxied through here. Read-only data
-(book, leaderboard, portfolio) still renders from the shared AppState
-directly, no HTTP hop needed since this runs in the same process.
+(book, leaderboard, portfolio, chat, options) pushes to the browser over
+one shared multi-channel WebSocket (/ws, see create_website_app) instead
+of each page polling its own REST endpoint on a timer — same in-process
+AppState reads either way, just a different transport.
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import time
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -102,13 +106,6 @@ PAGE_TEMPLATE = """<!doctype html>
 // Defined before any page content: per-product inline <script> blocks
 // below call these immediately as they're parsed, so definitions must
 // come first — script tags run in document order.
-async function poll(url, render, ms) {{
-  async function tick() {{
-    try {{ render(await (await fetch(url)).json()); }} catch (e) {{}}
-    setTimeout(tick, ms);
-  }}
-  tick();
-}}
 function timeSince(ts) {{
   if (ts === null || ts === undefined) return 'n/a';
   const s = Math.max(0, Date.now() / 1000 - ts);
@@ -125,11 +122,53 @@ function setSession(accountId, key) {{
   localStorage.setItem('exchange-api-key', key);
   localStorage.setItem('exchange-account-id', accountId);
   lastSeenFillId = null; // reseed fill tracking for the (possibly new) account
+  connectSocket(); // reconnect so the 'portfolio' channel starts flowing with this key
 }}
 function clearSession() {{
   localStorage.removeItem('exchange-api-key');
   localStorage.removeItem('exchange-account-id');
   lastSeenFillId = null;
+  portfolioData = null; // otherwise stale data lingers after logout — nothing clears it on its own
+  connectSocket(); // reconnect without a key — drops the 'portfolio' channel
+}}
+
+// -- shared WebSocket feed: one connection per page, multiplexing every
+// channel that page needs (book/portfolio/leaderboard/chat/options)
+// instead of a separate polling timer per data type. Each page sets
+// window.__wsChannels (an array, e.g. ['book:BTC-MINI']) before this
+// connects — see the trailing <script>connectSocket()</script> placed
+// after the page content below, which runs only after every page-content
+// script has already run and had a chance to set that array. --------------
+let socket = null;
+let socketReconnectTimer = null;
+const channelCallbacks = {{}};
+function onChannel(name, cb) {{
+  (channelCallbacks[name] = channelCallbacks[name] || []).push(cb);
+}}
+function wantedChannels() {{
+  const channels = new Set(window.__wsChannels || []);
+  if (getKey()) channels.add('portfolio');
+  return Array.from(channels);
+}}
+function connectSocket() {{
+  if (socketReconnectTimer) {{ clearTimeout(socketReconnectTimer); socketReconnectTimer = null; }}
+  if (socket) {{ try {{ socket.onclose = null; socket.close(); }} catch (e) {{}} }}
+  const channels = wantedChannels();
+  if (!channels.length) return;
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  let url = `${{proto}}://${{location.host}}/ws?channels=${{encodeURIComponent(channels.join(','))}}`;
+  const key = getKey();
+  if (key) url += `&key=${{encodeURIComponent(key)}}`;
+  socket = new WebSocket(url);
+  socket.onmessage = (evt) => {{
+    let msg;
+    try {{ msg = JSON.parse(evt.data); }} catch (e) {{ return; }}
+    (channelCallbacks[msg.channel] || []).forEach(cb => {{ try {{ cb(msg.data); }} catch (e) {{}} }});
+  }};
+  // Fixed short backoff, not exponential — a dropped connection (server
+  // restart, brief network blip) should recover fast and quietly; this
+  // isn't a distributed system with a thundering-herd risk at this scale.
+  socket.onclose = () => {{ socketReconnectTimer = setTimeout(connectSocket, 1000); }};
 }}
 
 // -- mute: suppresses both fill banners and the fill sound, persisted per
@@ -179,33 +218,45 @@ function showFillBanner(f) {{
   container.appendChild(el);
   setTimeout(() => el.remove(), 6000);
 }}
-async function pollFills() {{
-  const key = getKey();
-  if (!key) {{
-    lastSeenFillId = null;
-  }} else {{
-    try {{
-      const r = await fetch(API_BASE + '/fills', {{ headers: {{'X-API-Key': key}} }});
-      if (r.ok) {{
-        const fills = await r.json();
-        if (lastSeenFillId === null) {{
-          // first look at this account this session: seed silently, don't
-          // notify for fills that already happened before now.
-          lastSeenFillId = fills.length ? Math.max(...fills.map(f => f.id)) : 0;
-        }} else {{
-          const newOnes = fills.filter(f => f.id > lastSeenFillId).sort((a, b) => a.id - b.id);
-          for (const f of newOnes) {{
-            showFillBanner(f);
-            playFillSound();
-            lastSeenFillId = Math.max(lastSeenFillId, f.id);
-          }}
-        }}
-      }}
-    }} catch (e) {{}}
+// Latest 'portfolio' channel payload — state.portfolio()'s shape
+// (cash/balance/positions/open_orders/recent_fills/...), refreshed
+// automatically whenever the server pushes a change. getAccount()/
+// getOwnOrders() below read this synchronously instead of each doing
+// their own cross-origin fetch — one shared feed for the whole page.
+let portfolioData = null;
+function handlePortfolioUpdate(d) {{
+  if (d && d.error === 'invalid_key') {{
+    // The key no longer resolves server-side (e.g. the server restarted
+    // with a fresh in-memory session store) — drop back to the login form
+    // instead of silently showing stale data forever.
+    clearSession();
+    renderAccountBar();
+    if (window.onLogin) window.onLogin();
+    const msg = document.getElementById('ab-msg');
+    if (msg) msg.innerHTML = '<span class="err">session expired, please log in again</span>';
+    portfolioData = null;
+    return;
   }}
-  setTimeout(pollFills, 1500);
+  portfolioData = d;
+  const el = document.getElementById('ab-balance');
+  if (el && d) el.textContent = '$' + d.balance.toFixed(2);
+  if (d && d.recent_fills) {{
+    if (lastSeenFillId === null) {{
+      // first look at this account this session: seed silently, don't
+      // notify for fills that already happened before now.
+      lastSeenFillId = d.recent_fills.length ? Math.max(...d.recent_fills.map(f => f.id)) : 0;
+    }} else {{
+      const newOnes = d.recent_fills.filter(f => f.id > lastSeenFillId).sort((a, b) => a.id - b.id);
+      for (const f of newOnes) {{
+        showFillBanner(f);
+        playFillSound();
+        lastSeenFillId = Math.max(lastSeenFillId, f.id);
+      }}
+    }}
+  }}
+  if (window.onPortfolio) window.onPortfolio(d);
 }}
-pollFills();
+onChannel('portfolio', handlePortfolioUpdate);
 
 function renderAccountBar() {{
   const bar = document.getElementById('account-bar');
@@ -214,36 +265,12 @@ function renderAccountBar() {{
   if (key) {{
     bar.innerHTML = `Logged in as <b>${{accountId}}</b> &nbsp; balance: <span id="ab-balance">...</span> &nbsp; ` +
       `<button onclick="logout()">Log out</button>`;
-    pollBalance();
   }} else {{
     bar.innerHTML =
       `Username <input id="ab-user" size="12"> Password <input id="ab-pass" type="password" size="12"> ` +
       `<button onclick="doRegister()">Register</button> <button onclick="doLogin()">Log in</button> ` +
       `<span id="ab-msg"></span>`;
   }}
-}}
-async function pollBalance() {{
-  const key = getKey();
-  if (!key) return;
-  try {{
-    const r = await fetch(API_BASE + '/account', {{ headers: {{ 'X-API-Key': key }} }});
-    if (r.status === 401) {{
-      // Session no longer resolves server-side (e.g. the server restarted —
-      // accounts are in-memory only) — drop back to the login form instead
-      // of silently spinning forever.
-      clearSession();
-      renderAccountBar();
-      if (window.onLogin) window.onLogin();
-      const msg = document.getElementById('ab-msg');
-      if (msg) msg.innerHTML = '<span class="err">session expired, please log in again</span>';
-      return;
-    }}
-    if (!r.ok) return;
-    const d = await r.json();
-    const el = document.getElementById('ab-balance');
-    if (el) el.textContent = '$' + d.balance.toFixed(2);
-  }} catch (e) {{}}
-  setTimeout(pollBalance, 3000);
 }}
 async function doRegister() {{
   const account_id = document.getElementById('ab-user').value;
@@ -374,18 +401,10 @@ function onChartLeave(product) {{
 // -- ladder trading: global, parameterized by product (not per-product
 // closures) so multiple ladders on one page don't clobber each other's
 // handlers via a shared window.trade name. --------------------------------
-// refreshAllLadders forces every ladder's next-tick data fetch to happen
-// right now instead of waiting out the poll interval — called after this
-// user's own trade/cancel/drag actions, since that's the lag people
-// actually notice (you click, and your own order doesn't show up for up
-// to a full poll interval).
-function refreshAllLadders() {{
-  for (const k in window) {{
-    if (k.startsWith('refreshLadder_') && typeof window[k] === 'function') {{
-      try {{ window[k](); }} catch (e) {{}}
-    }}
-  }}
-}}
+// No explicit "refresh now" after an action (there used to be one, forcing
+// every ladder to re-poll immediately) — the WS feed already pushes the
+// resulting book/portfolio change within one server tick (~200ms) on its
+// own, same latency the forced refresh used to achieve, automatically.
 async function trade(product, side, price, qtyOverride) {{
   const key = getKey();
   if (!key) {{ alert('log in first (top of page)'); return; }}
@@ -407,8 +426,6 @@ async function trade(product, side, price, qtyOverride) {{
     // nothing and the student had no reason to believe a retry would help.
     alert('order request failed: ' + e.message);
   }}
-  ownOrdersCache = null;
-  refreshAllLadders();
 }}
 // Tracks order ids with a cancel already in flight — without this, a
 // double-click (or a stale re-render landing a second click before the
@@ -441,41 +458,20 @@ async function cancelWorking(orderIds) {{
     // student knows to retry instead of clicking blindly a few more times.
     alert('cancel failed for order(s): ' + failures.join(', '));
   }}
-  ownOrdersCache = null; // force a fresh fetch, don't show a stale cached copy
-  refreshAllLadders();
 }}
 
 // Shared across both products' ladders (not per-product) — halves the
 // request rate against the student's own rate limit (20 req/s), which
 // otherwise sits close enough to the ceiling that a manual click can
 // occasionally get 429'd by background polling and silently do nothing.
-// The two product loops tick independently (~200ms each), so it's common
-// for both to call this within the same window before the first fetch has
-// resolved — without the in-flight dedup below, that fires two separate
-// fetches instead of sharing one, quietly doubling the real request rate.
-let ownOrdersCache = null;
-let ownOrdersCacheAt = 0;
-let ownOrdersInFlight = null;
+// Both now just read the shared 'portfolio' channel payload (see
+// handlePortfolioUpdate above) instead of each fetching their own copy —
+// no caching/in-flight-dedup needed any more, it's a synchronous read of
+// whatever the WS feed most recently pushed. Kept as async functions
+// (and the exact same names) so every existing call site — ladder
+// rendering, the options chain, flatten/cancel-all — needs no changes.
 async function getOwnOrders() {{
-  const key = getKey();
-  if (!key) return null;
-  const now = Date.now();
-  if (ownOrdersCache && now - ownOrdersCacheAt < 150) return ownOrdersCache;
-  if (ownOrdersInFlight) return ownOrdersInFlight;
-  ownOrdersInFlight = (async () => {{
-    try {{
-      const r = await fetch(API_BASE + '/orders', {{ headers: {{'X-API-Key': key}} }});
-      if (!r.ok) return null;
-      ownOrdersCache = await r.json();
-      ownOrdersCacheAt = Date.now();
-      return ownOrdersCache;
-    }} catch (e) {{
-      return null;
-    }} finally {{
-      ownOrdersInFlight = null;
-    }}
-  }})();
-  return ownOrdersInFlight;
+  return portfolioData ? portfolioData.open_orders : null;
 }}
 async function loadOwnOrders(product) {{
   const orders = await getOwnOrders();
@@ -492,33 +488,10 @@ async function loadOwnOrders(product) {{
   return byPrice;
 }}
 
-// Shared across both products' ladders (not per-product) so showing
-// position/avg-entry above each ladder doesn't double the request rate —
-// one /account fetch covers every product's position in one response.
-// Same in-flight dedup reasoning as getOwnOrders above.
-let accountCache = null;
-let accountCacheAt = 0;
-let accountInFlight = null;
+// Same reasoning as getOwnOrders above — one shared 'portfolio' channel
+// payload covers every product's position, read synchronously.
 async function getAccount() {{
-  const key = getKey();
-  if (!key) return null;
-  const now = Date.now();
-  if (accountCache && now - accountCacheAt < 150) return accountCache;
-  if (accountInFlight) return accountInFlight;
-  accountInFlight = (async () => {{
-    try {{
-      const r = await fetch(API_BASE + '/account', {{ headers: {{'X-API-Key': key}} }});
-      if (!r.ok) return null;
-      accountCache = await r.json();
-      accountCacheAt = Date.now();
-      return accountCache;
-    }} catch (e) {{
-      return null;
-    }} finally {{
-      accountInFlight = null;
-    }}
-  }})();
-  return accountInFlight;
+  return portfolioData;
 }}
 
 // -- drag-to-reprice: drag a working cell onto another row's price to
@@ -566,6 +539,7 @@ async function dropReprice(evt, product, price) {{
 <div id="fill-banners"></div>
 <script>renderAccountBar(); renderMuteButton();</script>
 {body}
+<script>connectSocket();</script>
 </body>
 </html>"""
 
@@ -597,6 +571,7 @@ def _ladder_block(product: str, tick: float) -> str:
 (function() {{
   const product = '{product}';
   const tick = {tick};
+  (window.__wsChannels = window.__wsChannels || []).push('book:' + product);
   const scrollEl = document.getElementById('ladder-scroll-{product}');
   const rowHeightPx = 24;
 
@@ -795,78 +770,86 @@ def _ladder_block(product: str, tick: float) -> str:
     }}
   }});
 
-  // A fixed function (not the shared poll() helper) so it can be called
-  // both on a fast timer AND immediately after this user's own actions
-  // (trade/cancel/drag) — waiting out a full poll interval after your own
-  // click is the lag that actually gets noticed; refreshing on-demand
-  // right after the action resolves makes your own orders feel instant
-  // regardless of the ambient poll rate.
-  let inFlight = false;
-  async function fetchAndRender() {{
-    if (inFlight) return;
-    inFlight = true;
-    try {{
-      const d = await (await fetch('/data/book/{product}')).json();
-      const metrics = document.getElementById('metrics-{product}');
-      const fmt = (v) => v === null || v === undefined ? 'n/a' : v.toFixed(2);
-      metrics.innerHTML =
-        `<div>index <span>$${{fmt(d.index_price)}}</span></div>` +
-        `<div>mid <span>$${{fmt(d.mid)}}</span></div>` +
-        `<div>spread <span>${{d.spread_bps === null ? 'n/a' : d.spread_bps.toFixed(1) + ' bps'}}</span></div>` +
-        `<div>last trade <span>$${{fmt(d.last_trade)}} x ${{d.last_trade_qty ?? 'n/a'}}</span></div>` +
-        `<div>last trade time <span>${{timeSince(d.last_trade_ts)}}</span></div>` +
-        `<div>session volume <span>${{d.session_volume_qty}} ct ($${{d.session_volume_notional.toFixed(2)}})</span></div>` +
-        (d.stale ? '<div class="stale">STALE</div>' : '');
+  // Pushed by the server on the 'book:{product}' channel whenever this
+  // product's book/index/last-trade actually changes — no polling, no
+  // "refresh now after my own action" call needed, the next server tick
+  // (~200ms) already reflects any fill from this account's own click.
+  async function render(d) {{
+    const metrics = document.getElementById('metrics-{product}');
+    const fmt = (v) => v === null || v === undefined ? 'n/a' : v.toFixed(2);
+    metrics.innerHTML =
+      `<div>index <span>$${{fmt(d.index_price)}}</span></div>` +
+      `<div>mid <span>$${{fmt(d.mid)}}</span></div>` +
+      `<div>spread <span>${{d.spread_bps === null ? 'n/a' : d.spread_bps.toFixed(1) + ' bps'}}</span></div>` +
+      `<div>last trade <span>$${{fmt(d.last_trade)}} x ${{d.last_trade_qty ?? 'n/a'}}</span></div>` +
+      `<div>last trade time <span>${{timeSince(d.last_trade_ts)}}</span></div>` +
+      `<div>session volume <span>${{d.session_volume_qty}} ct ($${{d.session_volume_notional.toFixed(2)}})</span></div>` +
+      (d.stale ? '<div class="stale">STALE</div>' : '');
 
-      renderChart(product, d.sparkline);
+    renderChart(product, d.sparkline);
 
-      lastData = d;
-      if (autoCenter) {{
-        const price = currentCenterPrice();
-        if (price !== null) centerOn(price);
+    lastData = d;
+    if (autoCenter) {{
+      const price = currentCenterPrice();
+      if (price !== null) centerOn(price);
+      initialized = true;
+    }} else if (!range) {{
+      const price = currentCenterPrice();
+      if (!initialized) {{
+        centerOn(price);
         initialized = true;
-      }} else if (!range) {{
-        const price = currentCenterPrice();
-        if (!initialized) {{
-          centerOn(price);
-          initialized = true;
-        }} else {{
-          buildRange(price);
-        }}
+      }} else {{
+        buildRange(price);
       }}
+    }}
 
-      // Render the book (bid/ask/price columns) right away, same-origin
-      // and fast, using last cycle's ownByPrice — don't make it wait on
-      // the cross-origin, preflighted own-orders/account lookups below.
-      // On a real network those add real round trips; blocking the visible
-      // book update on them was exactly why a click felt slow to reflect.
-      renderRows();
+    renderRows();
+    await renderOwnState();
+  }}
+  async function renderOwnState() {{
+    const [own, account] = await Promise.all([loadOwnOrders(product), getAccount()]);
+    ownByPrice = own;
+    renderRows(); // cheap — diffed, only the working column actually changes
 
-      const [own, account] = await Promise.all([loadOwnOrders(product), getAccount()]);
-      ownByPrice = own;
-      renderRows(); // cheap now — diffed, only the working column actually changes
-
-      const posDiv = document.getElementById('position-{product}');
-      if (posDiv) {{
-        const pos = account && account.positions && account.positions['{product}'];
-        posDiv.textContent = pos
-          ? `position: ${{pos.qty}} @ $${{pos.avg_cost.toFixed(2)}}`
-          : (account ? 'position: flat' : 'position: log in to see your position');
-      }}
-    }} catch (e) {{
-      // ignore — next tick (or the next on-demand refresh) will retry
-    }} finally {{
-      inFlight = false;
+    const posDiv = document.getElementById('position-{product}');
+    if (posDiv) {{
+      const pos = account && account.positions && account.positions['{product}'];
+      posDiv.textContent = pos
+        ? `position: ${{pos.qty}} @ $${{pos.avg_cost.toFixed(2)}}`
+        : (account ? 'position: flat' : 'position: log in to see your position');
     }}
   }}
-  window['refreshLadder_{product}'] = fetchAndRender;
-
-  (function loop() {{
-    fetchAndRender().finally(() => setTimeout(loop, 200));
-  }})();
+  onChannel('book:' + product, render);
+  // The book itself might not change on a fill against a resting order at
+  // the same price level it was already at — but the working-order/
+  // position display still needs to catch up, so it also refreshes
+  // whenever the portfolio channel pushes independently of the book.
+  onChannel('portfolio', renderOwnState);
 }})();
 </script>
 """
+
+
+def _options_payload(state: AppState) -> dict:
+    """Current option chain summary — shared by the 'options' WS channel
+    (see create_website_app's ws_feed) so there's one implementation, not
+    a REST copy and a WS copy that could drift apart."""
+    now = time.time()
+    contracts = []
+    expiry_ts = None
+    for opt in state.options_manager.chain.values():
+        expiry_ts = opt.expiry_ts
+        book = state.engine.book_snapshot(opt.symbol, depth=1)
+        contracts.append({
+            "symbol": opt.symbol,
+            "strike": opt.strike,
+            "option_type": opt.option_type,
+            "theo": state.index_service.get_index_price(opt.symbol, now),
+            "bid": book["bids"][0]["price"] if book["bids"] else None,
+            "ask": book["asks"][0]["price"] if book["asks"] else None,
+        })
+    underlying_price = state.index_service.get_index_price(state.config.options.underlying, now)
+    return {"expiry_ts": expiry_ts, "contracts": contracts, "underlying_price": underlying_price}
 
 
 def create_website_app(state: AppState) -> FastAPI:
@@ -991,7 +974,8 @@ async function renderChainPositions() {{
     ? rows.map(([sym, pos]) => `<tr><td>${{sym}}</td><td>${{pos.qty}}</td><td>$${{pos.avg_cost.toFixed(2)}}</td></tr>`).join('')
     : '<tr><td colspan="3">no open option positions</td></tr>';
 }}
-poll('/data/options', (d) => {{
+window.__wsChannels = ['options'];
+onChannel('options', (d) => {{
   document.getElementById('opt-expiry').textContent = d.expiry_ts
     ? new Date(d.expiry_ts * 1000).toLocaleTimeString() : 'n/a';
   const priceEl = document.getElementById('chain-underlying-price');
@@ -1002,7 +986,8 @@ poll('/data/options', (d) => {{
     renderOptionCell(c.strike, c.option_type, c);
   }}
   renderChainPositions();
-}}, 1000);
+}});
+onChannel('portfolio', renderChainPositions);
 window.onLogin = renderChainPositions;
 </script>
 """
@@ -1034,25 +1019,6 @@ window.onLogin = renderChainPositions;
             content = "<style>.topbar nav{display:none} body{padding:10px}</style>" + content
         return page(content)
 
-    @app.get("/data/options")
-    def data_options():
-        now = time.time()
-        contracts = []
-        expiry_ts = None
-        for opt in state.options_manager.chain.values():
-            expiry_ts = opt.expiry_ts
-            book = state.engine.book_snapshot(opt.symbol, depth=1)
-            contracts.append({
-                "symbol": opt.symbol,
-                "strike": opt.strike,
-                "option_type": opt.option_type,
-                "theo": state.index_service.get_index_price(opt.symbol, now),
-                "bid": book["bids"][0]["price"] if book["bids"] else None,
-                "ask": book["asks"][0]["price"] if book["asks"] else None,
-            })
-        underlying_price = state.index_service.get_index_price(state.config.options.underlying, now)
-        return {"expiry_ts": expiry_ts, "contracts": contracts, "underlying_price": underlying_price}
-
     @app.get("/leaderboard", response_class=HTMLResponse)
     def leaderboard_page():
         body = """
@@ -1060,12 +1026,13 @@ window.onLogin = renderChainPositions;
 <table><thead><tr><th>#</th><th>Account</th><th>Balance</th><th>Equity</th><th>Positions</th></tr></thead>
 <tbody id="lb"></tbody></table>
 <script>
-poll('/data/leaderboard', (rows) => {
+window.__wsChannels = ['leaderboard'];
+onChannel('leaderboard', (rows) => {
   document.getElementById('lb').innerHTML = rows.map((r, i) =>
     `<tr><td>${i+1}</td><td>${r.account_id}</td><td>$${r.cash.toFixed(2)}</td>` +
     `<td>$${r.equity.toFixed(2)}</td><td>${JSON.stringify(r.positions)}</td></tr>`
   ).join('');
-}, 2000);
+});
 </script>
 """
         return page(body)
@@ -1089,19 +1056,17 @@ poll('/data/leaderboard', (rows) => {
 <tbody id="pf-fills"></tbody></table>
 
 <script>
+window.__wsChannels = [];
 function loadPortfolio() {
-  const key = getKey();
-  if (!key) {
+  // No fetch any more — just shows the "log in" placeholder when logged
+  // out; when logged in, the shared 'portfolio' WS channel (auto-added by
+  // wantedChannels() whenever a key is present) pushes render(d) on its own.
+  if (!getKey()) {
     document.getElementById('pf-summary').innerHTML = '<div>log in above to see your portfolio</div>';
-    return;
   }
-  poll('/data/portfolio?key=' + encodeURIComponent(key), render, 2000);
 }
 function render(d) {
-  if (d.detail) {
-    document.getElementById('pf-summary').innerHTML = `<div>${d.detail}</div>`;
-    return;
-  }
+  if (!d || d.error) return; // handlePortfolioUpdate (shared script) already handles the error case
   const fmt = (v) => v.toFixed(2);
   document.getElementById('pf-summary').innerHTML =
     `<div>account <span>${d.account_id}</span></div>` +
@@ -1123,6 +1088,7 @@ function render(d) {
     `<td>${f.counterparty}</td><td>${new Date(f.timestamp * 1000).toLocaleTimeString()}</td></tr>`
   ).join('');
 }
+onChannel('portfolio', render);
 window.onLogin = loadPortfolio;
 loadPortfolio();
 
@@ -1136,7 +1102,6 @@ async function cancelAllOrders() {
   if (!openIds.length) { alert('no open orders to cancel'); return; }
   if (!confirm(`Cancel ${openIds.length} open order(s)?`)) return;
   await cancelWorking(openIds);
-  loadPortfolio();
 }
 
 async function flattenAllPositions() {
@@ -1162,8 +1127,6 @@ async function flattenAllPositions() {
       alert(`flatten ${product} failed: ${e.message}`);
     }
   }
-  accountCache = null;
-  loadPortfolio();
 }
 </script>
 """
@@ -1198,7 +1161,8 @@ function renderChatLog(messages) {
   }
   lastRenderedChatId = newestId;
 }
-poll('/data/chat', renderChatLog, 1500);
+window.__wsChannels = ['chat'];
+onChannel('chat', renderChatLog);
 
 async function sendChat() {
   const key = getKey();
@@ -1228,25 +1192,6 @@ async function sendChat() {
 """
         return page(body)
 
-    @app.get("/data/book/{product}")
-    def data_book(product: str):
-        if product not in state.engine.products:
-            raise HTTPException(status_code=404, detail="unknown product")
-        return state.market_snapshot(product)
-
-    @app.get("/data/leaderboard")
-    def data_leaderboard():
-        return state.leaderboard()
-
-    @app.get("/data/chat")
-    def data_chat():
-        # Read-only and unauthenticated (same-origin, in-process AppState
-        # read) — same pattern as /data/leaderboard. Sending a message
-        # still requires a real login: that goes straight to the public
-        # API's POST /chat with the student's own X-API-Key, same as
-        # placing an order, so a message is always attributable.
-        return list(state.chat_messages)
-
     @app.post("/data/register")
     def data_register(body: RegisterIn):
         try:
@@ -1255,11 +1200,55 @@ async function sendChat() {
             raise HTTPException(status_code=409, detail="account already registered, use login")
         return {"account_id": body.account_id, "api_key": key, "active": True}
 
-    @app.get("/data/portfolio")
-    def data_portfolio(key: str):
-        record = state.auth.resolve(key)
-        if record is None:
-            raise HTTPException(status_code=404, detail="unknown or inactive API key")
-        return state.portfolio(record.account_id)
+    def _channel_data(channel: str, key: str | None) -> object:
+        """Dispatch for the /ws feed below — one function per channel
+        name, each reusing exactly the same state read the REST routes
+        these replaced used to call. Returning None means "nothing to
+        send for this channel right now" (distinct from a real falsy
+        payload like an empty list), so ws_feed's dedup-by-content check
+        never mistakes "no data yet" for "data changed to nothing"."""
+        if channel == "leaderboard":
+            return state.leaderboard()
+        if channel == "chat":
+            return list(state.chat_messages)
+        if channel == "options":
+            return _options_payload(state)
+        if channel.startswith("book:"):
+            product = channel[len("book:"):]
+            if product not in state.engine.products:
+                return None
+            return state.market_snapshot(product)
+        if channel == "portfolio":
+            if key is None:
+                return None
+            record = state.auth.resolve(key)
+            if record is None:
+                return {"error": "invalid_key"}
+            return state.portfolio(record.account_id)
+        return None
+
+    @app.websocket("/ws")
+    async def ws_feed(websocket: WebSocket):
+        await websocket.accept()
+        channels = [c for c in (websocket.query_params.get("channels") or "").split(",") if c]
+        key = websocket.query_params.get("key")
+        last_sent: dict[str, str] = {}
+        try:
+            while True:
+                for channel in channels:
+                    data = _channel_data(channel, key)
+                    if data is None:
+                        continue
+                    payload = json.dumps({"channel": channel, "data": data}, default=str)
+                    # Only send when the payload actually changed — most
+                    # channels (leaderboard, an idle option contract's
+                    # book) don't change every tick, and there's no reason
+                    # to make the client re-render identical data.
+                    if last_sent.get(channel) != payload:
+                        last_sent[channel] = payload
+                        await websocket.send_text(payload)
+                await asyncio.sleep(0.2)
+        except WebSocketDisconnect:
+            pass
 
     return app

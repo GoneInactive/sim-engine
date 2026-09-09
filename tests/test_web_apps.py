@@ -73,9 +73,10 @@ def test_website_book_page_and_data_endpoint():
     assert r.status_code == 200
     assert "BTC-MINI" in r.text and "ETH-MINI" in r.text
 
-    r = client.get("/data/book/BTC-MINI", headers=auth)
-    assert r.status_code == 200
-    body = r.json()
+    with client.websocket_connect("/ws?channels=book:BTC-MINI") as ws:
+        msg = ws.receive_json()
+    assert msg["channel"] == "book:BTC-MINI"
+    body = msg["data"]
     assert body["index_price"] == 80.0
     # book is empty here (no bots quoting in this bare state), so the chart
     # data source falls back to the index price to stay continuous
@@ -101,26 +102,26 @@ def test_record_price_tick_uses_book_mid_not_index_when_book_populated():
     assert state.price_history["BTC-MINI"][-1] == 81.0
 
 
-def test_website_script_defines_poll_before_first_use():
-    # Regression: script tags execute in document order. poll()/renderChart()
-    # must be defined before any inline per-product <script> block calls them,
-    # or the call throws ReferenceError and the page renders nothing. The
-    # order books page has its own on-demand fetch loop now (not the shared
-    # poll() helper), so check it on the leaderboard page, which still uses
-    # the shared helper and still sits after it in the same PAGE_TEMPLATE.
+def test_website_script_defines_onchannel_before_first_use():
+    # Regression: script tags execute in document order. onChannel()/
+    # connectSocket() must be defined before any inline per-page <script>
+    # block calls them, and connectSocket() itself must run *after* every
+    # page-content script has had a chance to set window.__wsChannels and
+    # register its onChannel() callbacks — see the trailing
+    # <script>connectSocket()</script> placed after {body} in PAGE_TEMPLATE.
     state = make_state()
     client = TestClient(create_website_app(state))
     html = client.get("/leaderboard").text
-    define_pos = html.index("async function poll")
-    first_call_pos = html.index("poll('/data/leaderboard")
-    assert define_pos < first_call_pos
+    define_pos = html.index("function onChannel")
+    first_call_pos = html.index("onChannel('leaderboard'")
+    connect_call_pos = html.rindex("connectSocket()")
+    assert define_pos < first_call_pos < connect_call_pos
 
-    # The order books page's own fetch loop must at least be present and
-    # well-formed (defined and invoked within the same script tag, so
-    # cross-script-tag ordering can't break it the way poll() could).
+    # The order books page's own ladder channel registration must be
+    # present and well-formed.
     html = client.get("/").text
-    assert "async function fetchAndRender" in html
-    assert "function loop()" in html
+    assert "onChannel('book:' + product, render)" in html
+    assert "window.__wsChannels = window.__wsChannels || []" in html
 
 
 def test_admin_page_script_defines_poll_before_first_use():
@@ -189,10 +190,10 @@ def test_portfolio_data_endpoint():
     )
 
     website_client = TestClient(create_website_app(state))
-    auth = basic_auth_header(state.config.website_password)
-    r = website_client.get(f"/data/portfolio?key={r2.key}", headers=auth)
-    assert r.status_code == 200
-    body = r.json()
+    with website_client.websocket_connect(f"/ws?channels=portfolio&key={r2.key}") as ws:
+        msg = ws.receive_json()
+    assert msg["channel"] == "portfolio"
+    body = msg["data"]
     assert body["account_id"] == "s2"
     assert body["positions"]["BTC-MINI"] == {"qty": 2, "avg_cost": 70.0}
     # s2 was the taker (market buy): pays taker_fee_bps on the fill notional,
@@ -203,8 +204,9 @@ def test_portfolio_data_endpoint():
     assert body["recent_fills"][0]["role"] == "taker"
     assert abs(body["recent_fills"][0]["fee"] - expected_taker_fee) < 1e-9
 
-    r = website_client.get("/data/portfolio?key=bogus", headers=auth)
-    assert r.status_code == 404
+    with website_client.websocket_connect("/ws?channels=portfolio&key=bogus") as ws:
+        msg = ws.receive_json()
+    assert msg["data"] == {"error": "invalid_key"}
 
 
 def test_public_register_is_active_immediately_no_admin_gate():
