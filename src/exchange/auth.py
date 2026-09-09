@@ -98,8 +98,23 @@ class AuthStore:
 
     def login(self, account_id: str, password: str) -> ApiKeyRecord | None:
         record = self.by_account.get(account_id)
-        if record is None or record.password_hash is None:
+        if record is None:
             return None
+        if record.password_hash is None:
+            # Unclaimed account (admin-issued, or restored from a
+            # migration with no recoverable password — see
+            # persistence.py's import strategy) — claiming via /login
+            # must behave identically to claiming via /register, or a
+            # student whose script only ever calls login() (not
+            # register-then-login, like presentation/spread-trader.py
+            # does) gets stuck on a 401 that register() would have
+            # silently resolved. Same trust model either way: first
+            # caller with the right account_id sets the password.
+            salt = os.urandom(16)
+            record.password_salt = salt
+            record.password_hash = _hash_password(password, salt)
+            record.active = True
+            return record
         candidate = _hash_password(password, record.password_salt)
         if not hmac.compare_digest(candidate, record.password_hash):
             return None

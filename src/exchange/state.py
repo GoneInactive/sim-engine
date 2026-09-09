@@ -266,7 +266,17 @@ class AppState:
 
     def login_student(self, account_id: str, password: str) -> str | None:
         record = self.auth.login(account_id, password)
-        return record.key if record is not None else None
+        if record is None:
+            return None
+        # login() can itself claim a still-unclaimed account (see
+        # auth.py) — that sets a real password_hash for the first time,
+        # which must be persisted just like a normal register() would be,
+        # or it's back to unclaimed on the next restart.
+        if self.persistence_log is not None:
+            self.persistence_log.log_credentials(
+                account_id, record.key, record.active, record.password_salt, record.password_hash,
+            )
+        return record.key
 
     def admin_issue_key(self, account_id: str) -> str:
         """Admin-panel driven account creation: inactive until an admin
