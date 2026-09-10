@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass
 
 from .bots import BotManager
-from .config import MMBotDefaults, OptionsChainConfig, ProductConfig
+from .config import MMBotDefaults, NoiseBotDefaults, OptionsChainConfig, ProductConfig
 from .engine import MatchingEngine, OrderRejected
 from .index_feed import IndexPriceService
 from .models import Side
@@ -72,12 +72,14 @@ class OptionsChainManager:
         bot_manager: BotManager,
         cfg: OptionsChainConfig,
         mm_cfg: MMBotDefaults,
+        noise_cfg: NoiseBotDefaults | None = None,
     ):
         self.engine = engine
         self.index_service = index_service
         self.bot_manager = bot_manager
         self.cfg = cfg
         self.mm_cfg = mm_cfg
+        self.noise_cfg = noise_cfg
         self.chain: dict[str, OptionInstrument] = {}
 
     # -- pricing ------------------------------------------------------------
@@ -140,6 +142,13 @@ class OptionsChainManager:
                     skew_sensitivity=self.mm_cfg.skew_sensitivity,
                     requote_interval=self.mm_cfg.requote_interval,
                 )
+                if self.noise_cfg is not None:
+                    for i in range(self.noise_cfg.count):
+                        self.bot_manager.spawn_noise_bot(
+                            symbol,
+                            arrival_rate_per_sec=self.noise_cfg.arrival_rate_per_sec + 0.1 * i,
+                            max_size=self.noise_cfg.max_size,
+                        )
 
     def _settle_and_retire(self, opt: OptionInstrument, now: float) -> None:
         spot = self.index_service.get_index_price(opt.underlying, now)
@@ -165,6 +174,7 @@ class OptionsChainManager:
                     pass
 
         self.bot_manager.remove_mm_bot(opt.symbol)
+        self.bot_manager.remove_noise_bots(opt.symbol)
         self.engine.remove_product(opt.symbol)
         self.index_service.remove_product(opt.symbol)
         self.chain.pop(opt.symbol, None)

@@ -193,6 +193,23 @@ mm_bots:
     skew_sensitivity: 0.05
     requote_interval: 1.5
 
+# Noise-trader bots spawned alongside each options contract / futures
+# contract / calendar spread as it's created — same NoiseBot as the base
+# products (random side, random size, crosses the touch), just not wired
+# through mm_bots' legs/spread knobs since noise bots don't quote. `count`
+# noise bots are spawned per instrument, each at arrival_rate_per_sec +
+# 0.1*i (matching BotManager.spawn_defaults' stagger for the base
+# products) so they don't all fire in lockstep.
+noise_bots:
+  options:
+    count: 2
+    arrival_rate_per_sec: 0.2
+    max_size: 2
+  futures:
+    count: 2
+    arrival_rate_per_sec: 0.2
+    max_size: 2
+
 # "Insider" bots — a teaching/surveillance exercise, not a real strategy:
 # each gets advance knowledge of the next scheduled random market event
 # (see synthetic_feed.RandomEventScheduler.peek_next_event) and trades

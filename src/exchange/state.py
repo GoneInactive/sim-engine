@@ -25,6 +25,7 @@ from .index_feed import IndexPriceService
 from .ledger import apply_adjustment, equity, unrealized_pnl
 from .models import next_adjustment_id
 from .options import OptionsChainManager, next_boundary
+from .rfq import RFQManager
 
 if TYPE_CHECKING:
     from .persistence import PersistenceLog
@@ -111,7 +112,9 @@ class AppState:
         self.options_managers: dict[str, OptionsChainManager] = {}
         self.options_enabled: dict[str, bool] = {}
         for chain_id, occfg in config.options.items():
-            manager = OptionsChainManager(self.engine, self.index_service, self.bot_manager, occfg, config.mm_bots.options)
+            manager = OptionsChainManager(
+                self.engine, self.index_service, self.bot_manager, occfg, config.mm_bots.options, config.noise_bots.options,
+            )
             self.options_managers[chain_id] = manager
             enabled = occfg.enabled_default
             self.options_enabled[chain_id] = enabled
@@ -122,12 +125,16 @@ class AppState:
         # -- 1-hour rolling futures + calendar spreads --------------------
         self.futures_manager = FuturesChainManager(
             self.engine, self.index_service, self.bot_manager, config.futures, config.mm_bots.futures,
+            config.noise_bots.futures,
         )
         self.futures_enabled = config.futures.enabled_default
         if self.futures_enabled:
             now = time.time()
             for underlying in config.futures.underlyings:
                 self.futures_manager.init_chain(underlying, now)
+
+        # -- RFQs -------------------------------------------------------
+        self.rfq_manager = RFQManager(self.engine, self.is_tradeable)
 
         # -- insider bots ---------------------------------------------------
         if config.insider_bots.enabled_default:
@@ -396,6 +403,35 @@ class AppState:
             "role": role,
             "fee": fee,
             "counterparty": f.maker_account_id if is_taker else f.taker_account_id,
+        }
+
+    def quote_view(self, quote) -> dict:
+        return {
+            "id": quote.id,
+            "rfq_id": quote.rfq_id,
+            "account_id": quote.account_id,
+            "price": quote.price,
+            "qty": quote.qty,
+            "timestamp": quote.timestamp,
+            "status": quote.status,
+        }
+
+    def rfq_view(self, rfq, viewer_account_id: str) -> dict:
+        """Shared by the public API's /rfqs routes and the website's 'rfqs'
+        WS channel so there's one implementation of the requester-only
+        quote-visibility rule (see rfq.RFQManager.visible_quotes)."""
+        return {
+            "id": rfq.id,
+            "account_id": rfq.account_id,
+            "own": rfq.account_id == viewer_account_id,
+            "product": rfq.product,
+            "side": rfq.side.value,
+            "qty": rfq.qty,
+            "remaining_qty": rfq.remaining_qty,
+            "created_at": rfq.created_at,
+            "expires_at": rfq.expires_at,
+            "status": rfq.status,
+            "quotes": [self.quote_view(q) for q in self.rfq_manager.visible_quotes(rfq, viewer_account_id)],
         }
 
     def portfolio(self, account_id: str, fill_limit: int = 50) -> dict:

@@ -152,6 +152,19 @@ class MMBotsConfig:
 
 
 @dataclass(frozen=True)
+class NoiseBotDefaults:
+    count: int
+    arrival_rate_per_sec: float
+    max_size: int
+
+
+@dataclass(frozen=True)
+class NoiseBotsConfig:
+    options: NoiseBotDefaults
+    futures: NoiseBotDefaults
+
+
+@dataclass(frozen=True)
 class InsiderBotsConfig:
     enabled_default: bool
     count: int
@@ -178,6 +191,7 @@ class Config:
     options: dict[str, OptionsChainConfig]
     futures: FuturesConfig
     mm_bots: MMBotsConfig
+    noise_bots: NoiseBotsConfig
     insider_bots: InsiderBotsConfig
 
 
@@ -309,6 +323,19 @@ def load_config(path: Path | str | None = None) -> Config:
         futures=_mm_defaults(mm_bots_raw.get("futures", mm_bots_raw.get("default", {}))),
     )
 
+    def _noise_defaults(d: dict) -> NoiseBotDefaults:
+        return NoiseBotDefaults(
+            count=int(d.get("count", 3)),
+            arrival_rate_per_sec=float(d.get("arrival_rate_per_sec", 0.3)),
+            max_size=int(d.get("max_size", 2)),
+        )
+
+    noise_bots_raw = raw.get("noise_bots", {})
+    noise_bots = NoiseBotsConfig(
+        options=_noise_defaults(noise_bots_raw.get("options", {})),
+        futures=_noise_defaults(noise_bots_raw.get("futures", {})),
+    )
+
     insider_raw = raw.get("insider_bots", {})
     insider_bots = InsiderBotsConfig(
         enabled_default=bool(insider_raw.get("enabled_default", False)),
@@ -335,5 +362,6 @@ def load_config(path: Path | str | None = None) -> Config:
         options=options,
         futures=futures,
         mm_bots=mm_bots,
+        noise_bots=noise_bots,
         insider_bots=insider_bots,
     )

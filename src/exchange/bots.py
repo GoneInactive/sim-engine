@@ -478,6 +478,9 @@ class BotManager:
     def remove_mm_bot(self, product: str) -> None:
         self.mm_bots = [b for b in self.mm_bots if b.product != product]
 
+    def remove_noise_bots(self, product: str) -> None:
+        self.noise_bots = [b for b in self.noise_bots if b.product != product]
+
     def tick(self, now: float | None = None) -> None:
         now = now if now is not None else time.time()
         for bot in self.mm_bots:

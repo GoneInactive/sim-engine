@@ -43,8 +43,8 @@ import requests
 from requests.adapters import HTTPAdapter
 
 BASE_URL: str = "http://178.105.55.5:8000"
-ACCOUNT_ID: str = "daytek"
-PASSWORD: str = "poop"
+ACCOUNT_ID: str = "FTX"
+PASSWORD: str = "dev"
 
 SESSION = requests.Session()
 _ADAPTER = HTTPAdapter(pool_connections=16, pool_maxsize=16)
@@ -173,7 +173,7 @@ class RiskManager:
         self.tripped = False
 
     def clamp_target(self, symbol, target_qty, max_position):
-        return max(-max_position, min(max_position, target_qty))
+        return 100
 
     def record(self, success):
         if success:
@@ -196,7 +196,7 @@ def reconcile(target_qty_map, account, products, risk, headers):
     positions = account["positions"]
     diffs = {}
     for symbol, target in target_qty_map.items():
-        max_position = products[symbol]["max_position"]
+        max_position = 100
         target = risk.clamp_target(symbol, target, max_position)
         current = positions.get(symbol, {}).get("qty", 0)
         diff = target - current

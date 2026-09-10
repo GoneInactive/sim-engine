@@ -92,6 +92,18 @@ PAGE_TEMPLATE = """<!doctype html>
   .chain-table td.call-cell, .chain-table td.put-cell {{ cursor:pointer; }}
   .chain-table td.call-cell:hover, .chain-table td.put-cell:hover {{ background:#eef3ff; }}
   .chain-positions {{ margin-top:20px; max-width:640px; }}
+  .spread-matrix {{ border-collapse:collapse; margin-bottom:24px; }}
+  .spread-matrix th, .spread-matrix td {{ text-align:center; padding:0; border:1px solid #ccc; font-size:12px; min-width:78px; height:40px; }}
+  .spread-matrix th {{ background:#f6f6f6; font-weight:700; padding:4px; }}
+  .spread-matrix th.corner {{ background:#fff; border:none; }}
+  .spread-matrix td.diag {{ background:#f0f0f0; font-weight:700; }}
+  .spread-matrix td.spread-cell {{ cursor:pointer; }}
+  .spread-matrix td.spread-cell:hover {{ outline:2px solid #000; outline-offset:-2px; }}
+  .spread-matrix td.na {{ color:#bbb; }}
+  .spread-matrix .mm-bid {{ color:#0a5dd6; }}
+  .spread-matrix .mm-ask {{ color:#c62828; }}
+  .spread-matrix .mm-cell {{ display:flex; flex-direction:column; justify-content:center; height:100%; line-height:1.3; }}
+  .spread-matrix tr:hover td:not(.na) {{ filter:brightness(0.95); }}
   .chain-sidebar {{ position:fixed; top:0; right:0; width:480px; max-width:92vw; height:100vh;
     background:#fff; border-left:1px solid #000; box-shadow:-6px 0 20px rgba(0,0,0,0.15);
     transform:translateX(100%); transition:transform 0.2s ease; z-index:2000; display:flex; flex-direction:column; }}
@@ -860,22 +872,38 @@ def _options_payload(state: AppState, chain_id: str) -> dict:
 
 def _futures_payload(state: AppState) -> dict:
     """Live futures contracts + calendar spreads per underlying — shared by
-    the 'futures_matrix' WS channel and the Inter-Spread page."""
+    the 'futures_matrix' WS channel and the Inter-Spread page's TT-style
+    spread matrix (one row/column per live contract month, off-diagonal
+    cells are the calendar spread between that pair). Includes top-of-book
+    bid/ask (not just the index/theo 'last') so the matrix reads like an
+    actual quote grid, same as the options chain."""
     now = time.time()
     out: dict[str, dict] = {}
     for underlying in state.config.futures.underlyings:
         contracts = sorted(state.futures_manager.contracts[underlying].values(), key=lambda f: f.expiry_ts)
         spreads = sorted(state.futures_manager.calendar_spreads[underlying].values(), key=lambda c: c.symbol)
-        out[underlying] = {
-            "futures": [
-                {"symbol": f.symbol, "expiry_ts": f.expiry_ts, "last": state.index_service.get_index_price(f.symbol, now)}
-                for f in contracts
-            ],
-            "calendar_spreads": [
-                {"symbol": c.symbol, "near": c.near_symbol, "far": c.far_symbol, "last": state.index_service.get_index_price(c.symbol, now)}
-                for c in spreads
-            ],
-        }
+        futs_out = []
+        for f in contracts:
+            book = state.engine.book_snapshot(f.symbol, depth=1)
+            futs_out.append({
+                "symbol": f.symbol,
+                "expiry_ts": f.expiry_ts,
+                "last": state.index_service.get_index_price(f.symbol, now),
+                "bid": book["bids"][0]["price"] if book["bids"] else None,
+                "ask": book["asks"][0]["price"] if book["asks"] else None,
+            })
+        spreads_out = []
+        for c in spreads:
+            book = state.engine.book_snapshot(c.symbol, depth=1)
+            spreads_out.append({
+                "symbol": c.symbol,
+                "near": c.near_symbol,
+                "far": c.far_symbol,
+                "last": state.index_service.get_index_price(c.symbol, now),
+                "bid": book["bids"][0]["price"] if book["bids"] else None,
+                "ask": book["asks"][0]["price"] if book["asks"] else None,
+            })
+        out[underlying] = {"futures": futs_out, "calendar_spreads": spreads_out}
     return out
 
 
@@ -892,7 +920,7 @@ def create_website_app(state: AppState) -> FastAPI:
 
     nav = (
         '<nav><a href="/">Spot</a><a href="/options">Options Chain</a>'
-        '<a href="/inter-spread">Inter-Spread</a><a href="/leaderboard">Leaderboard</a>'
+        '<a href="/inter-spread">Inter-Spread</a><a href="/rfq">RFQs</a><a href="/leaderboard">Leaderboard</a>'
         '<a href="/portfolio">Portfolio</a><a href="/chat">Chat</a>'
         f'<a href="{state.config.network.admin_api_base_url}/" target="_blank">Admin</a></nav>'
     )
@@ -936,7 +964,9 @@ def create_website_app(state: AppState) -> FastAPI:
 <div class="cols">{_ladder_block(symbol, tick)}</div>
 
 <h3>Futures &amp; calendar spreads</h3>
-<p class="meta">Click any contract or calendar spread cell to open its ladder.
+<p class="meta">TT-style spread matrix: diagonal is each contract month's own outright market;
+off-diagonal is the calendar spread between that row and column (only adjacent months actually
+trade — a cell with no live market shows &mdash;). Click any cell to open its ladder.
 {"" if state.futures_enabled else "Currently disabled by the admin."}</p>
 <div id="futures-matrix"></div>
 
@@ -958,22 +988,56 @@ function closeImLadder() {{
   document.getElementById('im-sidebar').classList.remove('open');
   document.getElementById('im-sidebar-frame').src = 'about:blank';
 }}
+function monthLabel(f, i) {{
+  // Front month / back months, TT-matrix style, with the actual expiry
+  // clock time as a tooltip since these are 1-hour (not calendar-month)
+  // contracts.
+  return i === 0 ? 'Front' : `+${{i}}`;
+}}
+function mmCell(bid, ask, symbol, extraClass) {{
+  const fmt = (v) => v === null || v === undefined ? null : v.toFixed(2);
+  const b = fmt(bid), a = fmt(ask);
+  if (b === null && a === null) {{
+    return `<td class="na">&mdash;</td>`;
+  }}
+  return `<td class="spread-cell ${{extraClass || ''}}" onclick="openImLadder('${{symbol}}')" title="${{symbol}}">` +
+    `<div class="mm-cell"><span class="mm-bid">${{b ?? '—'}}</span><span class="mm-ask">${{a ?? '—'}}</span></div></td>`;
+}}
 function renderFuturesMatrix(data) {{
   const underlyings = {underlyings_json};
-  const fmt = (v) => v === null || v === undefined ? '—' : v.toFixed(2);
   document.getElementById('futures-matrix').innerHTML = underlyings.map(u => {{
     const info = data[u] || {{futures: [], calendar_spreads: []}};
-    const futCells = info.futures.map(f =>
-      `<td class="call-cell" onclick="openImLadder('${{f.symbol}}')">${{f.symbol}}<br>${{fmt(f.last)}}</td>`
-    ).join('') || '<td>none live</td>';
-    const calCells = info.calendar_spreads.map(c =>
-      `<td class="put-cell" onclick="openImLadder('${{c.symbol}}')">${{c.near}} / ${{c.far}}<br>${{fmt(c.last)}}</td>`
-    ).join('') || '<td>none live</td>';
+    const contracts = info.futures;
+    if (!contracts.length) {{
+      return `<div class="chain-underlying" style="font-size:15px;">${{u}}</div><p class="meta">none live</p>`;
+    }}
+    // near_symbol -> far_symbol -> spread info, for O(1) lookup per cell.
+    const bySymbolPair = {{}};
+    for (const c of info.calendar_spreads) {{
+      (bySymbolPair[c.near] = bySymbolPair[c.near] || {{}})[c.far] = c;
+    }}
+    const headerCells = contracts.map((f, i) => `<th title="${{f.symbol}}">${{monthLabel(f, i)}}</th>`).join('');
+    const rows = contracts.map((rowFut, i) => {{
+      const cells = contracts.map((colFut, j) => {{
+        if (i === j) {{
+          return mmCell(rowFut.bid, rowFut.ask, rowFut.symbol, 'diag');
+        }}
+        const near = i < j ? rowFut : colFut;
+        const far = i < j ? colFut : rowFut;
+        const cs = (bySymbolPair[near.symbol] || {{}})[far.symbol];
+        if (!cs) return `<td class="na">&mdash;</td>`;
+        if (i < j) return mmCell(cs.bid, cs.ask, cs.symbol);
+        // Lower triangle mirrors the same near/far spread, sign-flipped
+        // (far - near instead of near - far) — same instrument, just the
+        // other side of the same trade, same as a TT matrix's symmetric layout.
+        const flip = (v) => v === null || v === undefined ? null : -v;
+        return mmCell(flip(cs.ask), flip(cs.bid), cs.symbol);
+      }}).join('');
+      return `<tr><th title="${{rowFut.symbol}}">${{monthLabel(rowFut, i)}}</th>${{cells}}</tr>`;
+    }}).join('');
     return `<div class="chain-underlying" style="font-size:15px;">${{u}}</div>` +
-      `<table class="chain-table"><tbody>` +
-      `<tr><th style="text-align:left;">Futures</th>${{futCells}}</tr>` +
-      `<tr><th style="text-align:left;">Calendar spreads</th>${{calCells}}</tr>` +
-      `</tbody></table>`;
+      `<div style="overflow-x:auto;"><table class="spread-matrix"><thead>` +
+      `<tr><th class="corner"></th>${{headerCells}}</tr></thead><tbody>${{rows}}</tbody></table></div>`;
   }}).join('');
 }}
 window.__wsChannels = ['futures_matrix'];
@@ -1142,6 +1206,110 @@ window.onLogin = renderChainPositions;
             # (same localStorage session, same origin) since trading needs it.
             content = "<style>.topbar nav{display:none} body{padding:10px}</style>" + content
         return page(content)
+
+    @app.get("/rfq", response_class=HTMLResponse)
+    def rfq_page():
+        body = """
+<h2>RFQs</h2>
+<p class="meta">Ask for a firm two-way price on any size instead of working the book yourself —
+any other account can quote you back, you pick the one you like. Quotes are private: you only see
+your own quote on someone else's RFQ, and only the requester sees every quote on their own.</p>
+
+<h3>Request a quote</h3>
+<div style="display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap;">
+  <input id="rfq-product" placeholder="product (e.g. BTC-MINI)" style="width:170px;">
+  <select id="rfq-side"><option value="buy">buy</option><option value="sell">sell</option></select>
+  <input id="rfq-qty" type="number" min="1" placeholder="qty" style="width:80px;">
+  <input id="rfq-ttl" type="number" min="5" max="300" value="30" placeholder="ttl (s)" style="width:90px;">
+  <button onclick="createRfq()">Request quote</button>
+</div>
+<div id="rfq-msg" class="meta"></div>
+
+<h3>Open RFQs</h3>
+<table>
+<thead><tr><th>ID</th><th>Requester</th><th>Product</th><th>Side</th><th>Qty</th><th>Left</th><th>Expires</th><th>Quotes / action</th></tr></thead>
+<tbody id="rfq-list"><tr><td colspan="8">none open right now</td></tr></tbody>
+</table>
+
+<script>
+function fmtCountdown(expiresAt) {
+  const s = Math.round(expiresAt - Date.now() / 1000);
+  return s <= 0 ? 'expired' : s + 's';
+}
+async function createRfq() {
+  const key = getKey();
+  const msgEl = document.getElementById('rfq-msg');
+  if (!key) { msgEl.innerHTML = '<span class="err">log in above first</span>'; return; }
+  const product = document.getElementById('rfq-product').value.trim();
+  const side = document.getElementById('rfq-side').value;
+  const qty = parseInt(document.getElementById('rfq-qty').value, 10);
+  const ttl_seconds = parseFloat(document.getElementById('rfq-ttl').value) || 30;
+  if (!product || !qty || qty <= 0) { msgEl.innerHTML = '<span class="err">product and a positive qty are required</span>'; return; }
+  try {
+    const r = await fetch(API_BASE + '/rfqs', {
+      method: 'POST', headers: {'Content-Type': 'application/json', 'X-API-Key': key},
+      body: JSON.stringify({product, side, qty, ttl_seconds}),
+    });
+    const d = await r.json();
+    msgEl.innerHTML = r.ok ? '' : `<span class="err">${d.detail || r.status}</span>`;
+  } catch (e) {
+    msgEl.innerHTML = `<span class="err">${e.message}</span>`;
+  }
+}
+async function submitQuote(rfqId, inputId) {
+  const key = getKey();
+  if (!key) { alert('log in above first'); return; }
+  const price = parseFloat(document.getElementById(inputId).value);
+  if (!isFinite(price)) { alert('enter a price'); return; }
+  const r = await fetch(`${API_BASE}/rfqs/${rfqId}/quotes`, {
+    method: 'POST', headers: {'Content-Type': 'application/json', 'X-API-Key': key},
+    body: JSON.stringify({price}),
+  });
+  if (!r.ok) { const d = await r.json().catch(() => ({})); alert(`quote rejected: ${d.detail || r.status}`); }
+}
+async function acceptQuote(rfqId, quoteId) {
+  const key = getKey();
+  if (!key) { alert('log in above first'); return; }
+  const r = await fetch(`${API_BASE}/rfqs/${rfqId}/quotes/${quoteId}/accept`, {
+    method: 'POST', headers: {'X-API-Key': key},
+  });
+  if (!r.ok) { const d = await r.json().catch(() => ({})); alert(`accept failed: ${d.detail || r.status}`); }
+}
+async function cancelRfq(rfqId) {
+  const key = getKey();
+  if (!key) { alert('log in above first'); return; }
+  const r = await fetch(`${API_BASE}/rfqs/${rfqId}`, {method: 'DELETE', headers: {'X-API-Key': key}});
+  if (!r.ok) { const d = await r.json().catch(() => ({})); alert(`cancel failed: ${d.detail || r.status}`); }
+}
+function renderRfqQuotesCell(rfq) {
+  if (rfq.own) {
+    if (!rfq.quotes.length) return '<span class="meta">waiting for quotes…</span> ' +
+      `<button onclick="cancelRfq(${rfq.id})" style="font-size:11px; padding:1px 6px;">Cancel</button>`;
+    return rfq.quotes.map(q =>
+      `<div>${q.account_id} @ ${q.price.toFixed(2)} x${q.qty} [${q.status}]` +
+      (q.status === 'open' ? ` <button onclick="acceptQuote(${rfq.id},${q.id})" style="font-size:11px; padding:1px 6px;">Accept</button>` : '') +
+      `</div>`
+    ).join('') + `<button onclick="cancelRfq(${rfq.id})" style="font-size:11px; padding:1px 6px; margin-top:4px;">Cancel RFQ</button>`;
+  }
+  const mine = rfq.quotes[0]; // only ever contains our own quote(s), per the API's visibility rule
+  if (mine) return `<span class="meta">your quote: ${mine.price.toFixed(2)} x${mine.qty} [${mine.status}]</span>`;
+  const inputId = `rfq-quote-price-${rfq.id}`;
+  return `<input id="${inputId}" type="number" step="any" placeholder="your price" style="width:90px;"> ` +
+    `<button onclick="submitQuote(${rfq.id}, '${inputId}')" style="font-size:11px; padding:1px 6px;">Quote</button>`;
+}
+function renderRfqs(rows) {
+  const tbody = document.getElementById('rfq-list');
+  tbody.innerHTML = rows.length ? rows.map(rfq => `<tr>` +
+    `<td>${rfq.id}</td><td>${rfq.account_id}${rfq.own ? ' (you)' : ''}</td><td>${rfq.product}</td>` +
+    `<td>${rfq.side}</td><td>${rfq.qty}</td><td>${rfq.remaining_qty}</td>` +
+    `<td>${fmtCountdown(rfq.expires_at)}</td><td>${renderRfqQuotesCell(rfq)}</td></tr>`
+  ).join('') : '<tr><td colspan="8">none open right now</td></tr>';
+}
+window.__wsChannels = ['rfqs'];
+onChannel('rfqs', renderRfqs);
+</script>
+"""
+        return page(body)
 
     @app.get("/leaderboard", response_class=HTMLResponse)
     def leaderboard_page():
@@ -1344,6 +1512,12 @@ async function sendChat() {
             return _options_payload(state, chain_id)
         if channel == "futures_matrix":
             return _futures_payload(state)
+        if channel == "rfqs":
+            viewer_account_id = None
+            if key is not None:
+                record = state.auth.resolve(key)
+                viewer_account_id = record.account_id if record else None
+            return [state.rfq_view(r, viewer_account_id or "") for r in state.rfq_manager.list_open_rfqs()]
         if channel.startswith("book:"):
             product = channel[len("book:"):]
             if product not in state.engine.products:

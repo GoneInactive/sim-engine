@@ -14,6 +14,7 @@ from .engine import OrderRejected
 from .ledger import equity, unrealized_pnl
 from .models import OrderType, Side
 from .rate_limit import TokenBucketLimiter
+from .rfq import DEFAULT_TTL_SECONDS, RFQError
 from .state import AppState
 
 
@@ -37,6 +38,18 @@ class LoginIn(BaseModel):
 
 class ChatIn(BaseModel):
     text: str
+
+
+class RFQIn(BaseModel):
+    product: str
+    side: Side
+    qty: int
+    ttl_seconds: float = DEFAULT_TTL_SECONDS
+
+
+class QuoteIn(BaseModel):
+    price: float
+    qty: Optional[int] = None
 
 
 def create_public_app(state: AppState) -> FastAPI:
@@ -192,6 +205,60 @@ def create_public_app(state: AppState) -> FastAPI:
             return state.post_chat_message(auth.account_id, body.text)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
+
+    # -- RFQs: any account can ask for a quote, any account (other than the
+    # requester) can supply liquidity by quoting back a firm price. See
+    # rfq.py's module docstring for why this is deliberately not book-based.
+    @app.post("/rfqs")
+    def create_rfq(body: RFQIn, auth: ApiKeyRecord = Depends(auth_dep)):
+        try:
+            r = state.rfq_manager.create_rfq(auth.account_id, body.product, body.side, body.qty, body.ttl_seconds)
+        except RFQError as e:
+            raise HTTPException(status_code=400, detail=e.reason)
+        return state.rfq_view(r, auth.account_id)
+
+    @app.get("/rfqs")
+    def list_rfqs(product: Optional[str] = None, auth: ApiKeyRecord = Depends(auth_dep)):
+        return [state.rfq_view(r, auth.account_id) for r in state.rfq_manager.list_open_rfqs(product)]
+
+    @app.get("/rfqs/{rfq_id}")
+    def get_rfq(rfq_id: int, auth: ApiKeyRecord = Depends(auth_dep)):
+        r = state.rfq_manager.get_rfq(rfq_id)
+        if r is None:
+            raise HTTPException(status_code=404, detail="no such RFQ")
+        return state.rfq_view(r, auth.account_id)
+
+    @app.delete("/rfqs/{rfq_id}")
+    def cancel_rfq(rfq_id: int, auth: ApiKeyRecord = Depends(auth_dep)):
+        try:
+            r = state.rfq_manager.cancel_rfq(rfq_id, auth.account_id)
+        except RFQError as e:
+            raise HTTPException(status_code=400, detail=e.reason)
+        return state.rfq_view(r, auth.account_id)
+
+    @app.post("/rfqs/{rfq_id}/quotes")
+    def submit_quote(rfq_id: int, body: QuoteIn, auth: ApiKeyRecord = Depends(auth_dep)):
+        try:
+            q = state.rfq_manager.submit_quote(rfq_id, auth.account_id, body.price, body.qty)
+        except RFQError as e:
+            raise HTTPException(status_code=400, detail=e.reason)
+        return state.quote_view(q)
+
+    @app.delete("/rfqs/{rfq_id}/quotes/{quote_id}")
+    def withdraw_quote(rfq_id: int, quote_id: int, auth: ApiKeyRecord = Depends(auth_dep)):
+        try:
+            q = state.rfq_manager.withdraw_quote(rfq_id, quote_id, auth.account_id)
+        except RFQError as e:
+            raise HTTPException(status_code=400, detail=e.reason)
+        return state.quote_view(q)
+
+    @app.post("/rfqs/{rfq_id}/quotes/{quote_id}/accept")
+    def accept_quote(rfq_id: int, quote_id: int, auth: ApiKeyRecord = Depends(auth_dep)):
+        try:
+            fill, r = state.rfq_manager.accept_quote(rfq_id, quote_id, auth.account_id)
+        except RFQError as e:
+            raise HTTPException(status_code=400, detail=e.reason)
+        return {"fill": state.fill_view(fill, auth.account_id), "rfq": state.rfq_view(r, auth.account_id)}
 
     return app
 

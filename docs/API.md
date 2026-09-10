@@ -271,6 +271,56 @@ Response `200`:
 convenience). `positions` only lists nonzero holdings. `equity` = cash +
 unrealized PnL against current index prices.
 
+### RFQs
+
+Ask the rest of the exchange for a firm two-way price on any size instead
+of working the book yourself — any other account (student or bot) can
+respond with a quote; you pick whichever one you like and accept it. This
+executes immediately, bilaterally, at the quoted price — it never touches
+the product's order book, so it doesn't move the visible market and can't
+be front-run off the book.
+
+Quote visibility is asymmetric on purpose: the requester sees every quote
+on their own RFQ (needed to compare and pick a winner); anyone else only
+ever sees their own quote(s) — not competing dealers' prices.
+
+| Route | Body | Response |
+|---|---|---|
+| `POST /rfqs` | `{"product", "side": "buy"\|"sell", "qty", "ttl_seconds"=30}` | Creates an RFQ. `ttl_seconds` is clamped to [5, 300]. `400` if `product` is unknown/disabled, `qty` isn't a positive integer, or you already have 5 open RFQs. |
+| `GET /rfqs` | `?product=` (optional filter) | Every currently **open** RFQ (yours and everyone else's) as a list of [RFQ](#rfq-shape). |
+| `GET /rfqs/{rfq_id}` | — | A single RFQ (any status). `404` if it doesn't exist. |
+| `DELETE /rfqs/{rfq_id}` | — | Cancels your own open RFQ (and withdraws any quotes on it). `400` — `"not your RFQ"` or `"RFQ is not open"`. |
+| `POST /rfqs/{rfq_id}/quotes` | `{"price", "qty"?}` | Quotes a firm price to fill (part of) someone else's RFQ. `qty` defaults to the RFQ's full remaining size. `400` — `"cannot quote your own RFQ"`, `"RFQ is not open"`, `"qty exceeds the RFQ's remaining size (...)"`, or a price-sign error (same rule as `POST /orders`). |
+| `DELETE /rfqs/{rfq_id}/quotes/{quote_id}` | — | Withdraws your own still-open quote. |
+| `POST /rfqs/{rfq_id}/quotes/{quote_id}/accept` | — | **Requester only.** Executes the trade at the quote's price. Response: `{"fill": <Fill>, "rfq": <RFQ>}`. `400` if you're not the requester, the RFQ/quote isn't open any more, or the product got disabled since the quote was posted. Any other quote left sized larger than what remains of the RFQ after this fill is automatically withdrawn (it can no longer be fully honored). |
+
+#### RFQ shape
+
+```jsonc
+{
+  "id": 7,
+  "account_id": "quant1",       // the requester
+  "own": true,                   // true iff this is your own RFQ (viewer-relative)
+  "product": "BTC-MINI",
+  "side": "buy",                  // the direction the requester wants to trade
+  "qty": 5,
+  "remaining_qty": 5,             // drops as quotes are accepted; RFQ auto-fills at 0
+  "created_at": 1789022665.07,
+  "expires_at": 1789022695.07,
+  "status": "open",               // "open" | "filled" | "expired" | "cancelled"
+  "quotes": [                     // every quote if you're the requester, else only your own
+    {"id": 3, "rfq_id": 7, "account_id": "mm_hopeful", "price": 77.52, "qty": 5,
+     "timestamp": 1789022670.1, "status": "open"}
+  ]
+}
+```
+
+An RFQ never appears in `GET /book/{product}` or the sparkline/volume
+stats a normal fill feeds — it's a private negotiation between two
+accounts, settled through the same ledger/fee/MAX_POSITION rules as any
+other fill, but off-book. The website's `rfqs` WS channel (see below)
+mirrors this same visibility rule for the browser UI at `/rfq`.
+
 ### `GET /leaderboard`
 
 No auth. Ranked by `equity` descending. Excludes bot accounts (`mm_`,
@@ -356,29 +406,45 @@ more fields than any single request body accepts (e.g. `product`,
 `account_id`, `active`), useful for inspecting current state before
 tweaking one field.
 
+Every option contract, futures contract, and calendar spread also gets its
+own MM bot **and** `noise_bots.options`/`noise_bots.futures`-many noise
+bots (`config.yaml` → `noise_bots:`, default 2 each) automatically as soon
+as it's created — you don't need to call `POST /bots`/`POST /bots/noise`
+for these yourself, and `GET /bots` / `GET /bots/noise` will list
+`mm_<symbol>_N` / `noise_<symbol>_N` accounts for them alongside the base
+products' bots. They're torn down automatically when that instrument
+expires/settles or the chain rolls, same lifecycle as its MM bot.
+
 ### Market data (admin view)
 
 | Route | Notes |
 |---|---|
-| `GET /market/{product}` | `404` for anything not in the **static** configured product list — this means it 404s for the spread symbol and live option contracts even though they're real, tradeable products. Use the website's `GET /data/book/{product}` for those instead (see below) — it checks the live engine, not the static config. |
+| `GET /market/{product}` | Checks the **live engine** (`state.engine.products`), not just the static config list — this resolves for the spread symbol, live option contracts, live futures contracts, and calendar spreads too, not just `BTC-MINI`/`ETH-MINI`. `404 {"detail": "unknown product"}` for anything not currently live (unknown symbol, or a real symbol that's expired/rolled off). The website's `GET /data/book/{product}` (see below) is the same check, just unauthenticated — either works for any live instrument. |
+| `GET /products` | Every currently-live tradeable symbol as a flat sorted list of strings (base products + spread + every live option/futures/calendar-spread symbol) — what the admin panel's own bot-spawn forms populate their product dropdown from. |
 
 Response (when it resolves): book, `index_price`, staleness, last trade,
 mid/spread_bps, a sparkline (up to 120 points), session volume — the same
 shape the website's ladder polls.
 
-### Spread & options instrument toggles
+### Spread, options & futures instrument toggles
 
 | Route | Body | Response |
 |---|---|---|
 | `GET /instruments/spread` | — | `{"symbol", "enabled"}` |
 | `POST /instruments/spread/enabled` | `{"enabled": bool}` | `{"symbol", "enabled"}` |
-| `GET /instruments/options` | — | `{"enabled", "underlying", "contracts": [{"symbol", "strike", "option_type", "expiry_ts", "theo", "bid", "ask"}, ...]}` |
-| `POST /instruments/options/enabled` | `{"enabled": bool}` | `{"enabled"}` |
+| `GET /instruments/options` | — | `{chain_id: {"enabled", "underlying", "contracts": [{"symbol", "strike", "option_type", "expiry_ts", "theo", "bid", "ask"}, ...]}, ...}` — **one entry per configured chain** (`btc`, `eth`, `btc_eth_spread` by default), not a single flat object. |
+| `POST /instruments/options/{chain_id}/enabled` | `{"enabled": bool}` | `{"chain_id", "enabled"}`. `404 {"detail": "no such options chain"}` for an unknown `chain_id`. |
+| `GET /instruments/futures` | — | `{"enabled", "underlyings": {underlying: {"futures": [{"symbol", "expiry_ts", "last"}, ...], "calendar_spreads": [{"symbol", "near", "far", "last"}, ...]}, ...}}` |
+| `POST /instruments/futures/enabled` | `{"enabled": bool}` | `{"enabled"}` — applies to **every** underlying's futures ladder at once (there's no per-underlying toggle, unlike options' per-chain one). |
 
-`GET /instruments/options` is the one admin-side route that *does* list
-every live contract with strike/theo/bid/ask in one call — handy for
-scripting against the chain from the admin side even though students
-can't see this route.
+`GET /instruments/options` and `GET /instruments/futures` are the two
+admin-side routes that list every live contract (with strike/theo/bid/ask
+for options; symbol/expiry/last for futures and calendar spreads) in one
+call — handy for scripting against either chain from the admin side even
+though students can't see these routes. Note `GET /instruments/futures`
+doesn't include bid/ask (just the theo `last`) — hit `GET /market/{symbol}`
+per-contract, or the website's `futures_matrix` WS channel (see below), if
+you need top-of-book.
 
 ### `GET /`
 
@@ -390,18 +456,42 @@ request bodies if this doc and the source ever drift.
 
 ## Website JSON endpoints (port 8090)
 
-These back the browser UI. No auth on any of them except `/data/portfolio`
-(a query-param API key, not a header) — they're meant to be read by the
-page's own JS, not treated as a stable trading API, but they're
-convenient for scripting a presenter dashboard.
+The old per-page REST polling routes (`GET /data/book/{product}`,
+`GET /data/leaderboard`, `GET /data/options`, `GET /data/portfolio`) are
+**gone** — the website now pushes everything over one shared multi-channel
+WebSocket instead. `POST /data/register` is the only plain REST route left.
+No auth on either except the WS's own `key` query param.
 
 | Route | Params | Response |
 |---|---|---|
-| `GET /data/book/{product}` | — | Same shape as admin's `GET /market/{product}`, but checks the **live engine** — works for the spread symbol and option contracts, unlike the admin route. `404 {"detail": "unknown product"}` if truly unknown. |
-| `GET /data/leaderboard` | — | Identical to the public API's `GET /leaderboard` |
-| `GET /data/options` | — | `{"expiry_ts", "contracts": [{"symbol", "strike", "option_type", "theo", "bid", "ask"}, ...], "underlying_price"}` — everything needed to render the options chain in one call, including the live BTC index price |
-| `GET /data/portfolio` | `?key=<api_key>` | `{"account_id", "cash", "balance", "realized_pnl", "positions", "unrealized_pnl", "equity", "frozen", "recent_fills": [...] (last 50), "open_orders": [...]}` — everything the portfolio page shows, one call |
 | `POST /data/register` | `{"account_id", "password"}` | Mirrors the public API's `/register`; the site's own JS actually calls the public API directly instead, so this route mostly exists for parity |
+| `WS /ws` | `?channels=<comma-separated>&key=<api_key optional>` | Subscribes to one or more channels (below); each pushes `{"channel": "<name>", "data": <payload>}` as a text frame whenever that channel's payload actually changes (polled server-side every 0.2s, but deduped — a quiet channel doesn't spam identical frames). `key` is only needed for the `portfolio` channel. |
+
+### `/ws` channels
+
+Not a stable public API (same caveat as the old `/data/*` routes — this is
+what the site's own JS uses), but the only place left to read this data
+without polling per-product REST, and genuinely convenient for a live
+dashboard or a bot that wants push updates instead of tight-polling
+`GET /book/{product}`:
+
+| Channel | Payload (the `data` field) |
+|---|---|
+| `book:<product>` | Same shape as admin's `GET /market/{product}` (book, `index_price`, staleness, last trade, mid/spread_bps, sparkline, session volume) — works for **any** live product: base products, the spread symbol, a live option contract, a live futures contract, or a calendar spread. |
+| `options:<chain_id>` | `{"expiry_ts", "contracts": [{"symbol", "strike", "option_type", "theo", "bid", "ask"}, ...], "underlying_price"}` for that chain (`btc`, `eth`, `btc_eth_spread` by default — see `config.yaml` → `options:`). Unknown/disabled `chain_id` just never sends anything on that channel rather than erroring. |
+| `futures_matrix` | `{underlying: {"futures": [{"symbol", "expiry_ts", "last", "bid", "ask"}, ...], "calendar_spreads": [{"symbol", "near", "far", "last", "bid", "ask"}, ...]}, ...}` for every configured futures underlying — the same data behind the Inter-Spread page's spread matrix. |
+| `leaderboard` | Identical to the public API's `GET /leaderboard` |
+| `rfqs` | Every open [RFQ](#rfq-shape), same requester-only quote-visibility rule as the public API (resolved from the WS `key` param; no `key` means every RFQ's `quotes` comes back empty). Backs the `/rfq` page. |
+| `portfolio` | Requires `key`; `{"account_id", "cash", "balance", "realized_pnl", "positions", "unrealized_pnl", "equity", "frozen", "recent_fills": [...] (last 50), "open_orders": [...]}`, or `{"error": "invalid_key"}` if `key` doesn't resolve |
+| `chat` | The last 200 chat messages, `[{"id", "account_id", "text", "timestamp"}, ...]` |
+
+```python
+import json, websocket
+ws = websocket.create_connection("ws://127.0.0.1:8090/ws?channels=options:btc,futures_matrix")
+while True:
+    msg = json.loads(ws.recv())
+    print(msg["channel"], msg["data"])
+```
 
 ---
 
@@ -447,7 +537,7 @@ The Admin API has no rate limiting at all.
 ## Instruments you can't discover via `GET /products`
 
 `GET /products` only lists the two YAML-configured spot products
-(`BTC-MINI`, `ETH-MINI`). Two more tradeable products exist but are
+(`BTC-MINI`, `ETH-MINI`). Several more tradeable products exist but are
 deliberately left off that list:
 
 - **The BTC-ETH spread** (`BTC-ETH-MINI` by default, `config.yaml` →
@@ -459,19 +549,45 @@ deliberately left off that list:
   two index prices — there's no server endpoint that hands you this
   number directly.
 
-- **The 15-minute BTC options chain** — symbols look like
-  `BTC-0515-77.00C` (`BTC-{expiry HHMM UTC}-{strike:.2f}{C|P}`). Neither
-  the symbol list nor the strike ladder is available from the public API.
-  A bot has to either read the website's unauthenticated
-  `GET /data/options` (not really "the API," but convenient), or derive
-  candidate symbols itself from the same rules the server uses
-  (`window_seconds`, `strikes_each_side`, `strike_increment` — hardcode
-  these from `config.yaml`'s `options:` block) and confirm each guess is
-  currently live via `GET /book/{symbol}` (a `404` means that
-  strike/window isn't trading right now). See `notebook/vol_trader.py`
-  for a working example of the second approach.
+- **Options chains** — there are three independent 15-minute chains by
+  default (`config.yaml` → `options:` — `btc` on `BTC-MINI`, `eth` on
+  `ETH-MINI`, `btc_eth_spread` on the `BTC-ETH-MINI` spread itself), each
+  with its own window length, strikes, and implied vol. Symbols look like
+  `BTC-0515-77.00C` (`{chain-id prefix}-{expiry HHMM UTC}-{strike:.2f}{C|P}`
+  — see `OptionsChainManager._symbol`). Neither the chain list, the symbol
+  list, nor the strike ladder is available from the public API. A bot has
+  to either subscribe to the website's `options:<chain_id>` WS channel
+  (see [`/ws` channels](#ws-channels) above — not really "the API," but
+  convenient and pushed live), or derive candidate symbols itself from the
+  same rules the server uses (`window_seconds`, `strikes_each_side`,
+  `strike_increment` — hardcode these from `config.yaml`'s `options:`
+  block, per chain) and confirm each guess is currently live via
+  `GET /book/{symbol}` (a `404` means that strike/window isn't trading
+  right now). See `notebook/vol_trader.py` for a working example of the
+  second approach (hardcoded against the `btc` chain).
 
-Both instruments can be toggled on/off by an admin
-(`POST /instruments/spread/enabled`, `POST /instruments/options/enabled`)
-— `POST /orders` against either while disabled gets rejected with
-`"{product} is currently disabled"`.
+- **Futures & calendar spreads** — `config.yaml` → `futures:` keeps
+  `num_live` (5 by default) 1-hour futures contracts rolling per
+  underlying (`BTC-MINI`, `ETH-MINI`), each `window_seconds` apart and
+  cash-settled at the underlying's index price on expiry, plus one
+  calendar spread auto-registered between every adjacent pair of live
+  contracts. Futures symbols look like `BTC-FUT-091507`
+  (`{underlying's base ticker}-FUT-{expiry as MMDDHH UTC}` — see
+  `FuturesChainManager._contract_symbol`); calendar spread symbols are
+  just the two legs joined, e.g. `BTC-FUT-091507_BTC-FUT-091607-CAL`
+  (`{near symbol}_{far symbol}-CAL`), and price as `near - far` (both
+  already contract-scaled), so unlike every other instrument here they
+  legitimately trade at a negative price. Same story as options — no
+  public-API listing endpoint — subscribe to the website's
+  `futures_matrix` WS channel to discover what's currently live (symbols,
+  expiries, top-of-book), or reconstruct the ladder yourself from
+  `window_seconds`/`num_live` and confirm each guess via
+  `GET /book/{symbol}`.
+
+All of the above can be toggled on/off by an admin
+(`POST /instruments/spread/enabled`, `POST /instruments/options/{chain_id}/enabled`,
+`POST /instruments/futures/enabled`) — `POST /orders` against any of them
+while disabled gets rejected with `"{product} is currently disabled"`.
+Disabling never tears down an in-flight chain/ladder early; it just stops
+new contracts from being created once the current ones expire/roll, so
+open positions always get to settle normally.

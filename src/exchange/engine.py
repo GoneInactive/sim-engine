@@ -251,28 +251,7 @@ class MatchingEngine:
 
         product_cfg = self.products[product]
         now_ts = now if now is not None else time.time()
-        if account_id not in self.unlimited_position_accounts:
-            pos = account.position_for(product)
-            # Worst case exposure: current filled position, plus every resting
-            # order this account already has open on this product (they could
-            # all fill), plus this new order's full qty. Reads the small
-            # per-account/product resting index, not the full order history.
-            resting = self.resting_orders_by_account_product.get(account_id, {}).get(product, {})
-            committed = pos.qty + sum(o.side.sign * o.remaining_qty for o in resting.values())
-            prospective = committed + side.sign * qty
-            mark_price = self.mark_price_fn(product, now_ts) if self.mark_price_fn else None
-            if mark_price is None:
-                # Same contract-scaling IndexPriceService.on_raw_tick applies
-                # to every real tick — starting_price alone is the *raw*
-                # underlying price for a base product (e.g. BTC-MINI's
-                # 77500.0), not the ~77.5 contract-notional price everything
-                # else in this cap is denominated in.
-                mark_price = product_cfg.starting_price * product_cfg.contract_size
-            max_position = ledger.max_position_for(account.cash, product_cfg.leverage, mark_price)
-            if abs(prospective) > max_position:
-                raise OrderRejected(
-                    f"order would breach MAX_POSITION ({max_position}, {product_cfg.leverage}x balance) for {product}"
-                )
+        self._check_max_position(account, product, product_cfg, side, qty, now_ts)
 
         order = Order(
             id=next_order_id(),
@@ -311,6 +290,33 @@ class MatchingEngine:
         if self._on_order is not None:
             self._on_order(order)
         return order
+
+    def _check_max_position(
+        self, account: Account, product: str, product_cfg: ProductConfig, side: Side, qty: int, now_ts: float,
+    ) -> None:
+        if account.id in self.unlimited_position_accounts:
+            return
+        pos = account.position_for(product)
+        # Worst case exposure: current filled position, plus every resting
+        # order this account already has open on this product (they could
+        # all fill), plus this new order's full qty. Reads the small
+        # per-account/product resting index, not the full order history.
+        resting = self.resting_orders_by_account_product.get(account.id, {}).get(product, {})
+        committed = pos.qty + sum(o.side.sign * o.remaining_qty for o in resting.values())
+        prospective = committed + side.sign * qty
+        mark_price = self.mark_price_fn(product, now_ts) if self.mark_price_fn else None
+        if mark_price is None:
+            # Same contract-scaling IndexPriceService.on_raw_tick applies
+            # to every real tick — starting_price alone is the *raw*
+            # underlying price for a base product (e.g. BTC-MINI's
+            # 77500.0), not the ~77.5 contract-notional price everything
+            # else in this cap is denominated in.
+            mark_price = product_cfg.starting_price * product_cfg.contract_size
+        max_position = ledger.max_position_for(account.cash, product_cfg.leverage, mark_price)
+        if abs(prospective) > max_position:
+            raise OrderRejected(
+                f"order would breach MAX_POSITION ({max_position}, {product_cfg.leverage}x balance) for {product}"
+            )
 
     def cancel_order(self, order_id: int, account_id: str) -> Order:
         order = self.orders.get(order_id)
@@ -432,6 +438,80 @@ class MatchingEngine:
         self.fills_by_account.setdefault(account_id, []).append(fill)
         self.volume_qty[product] = self.volume_qty.get(product, 0) + qty
         self.volume_notional[product] = self.volume_notional.get(product, 0.0) + price * qty
+        if self._on_fill is not None:
+            self._on_fill(fill)
+        return fill
+
+    def execute_negotiated_trade(
+        self,
+        requester_account_id: str,
+        provider_account_id: str,
+        product: str,
+        requester_side: Side,
+        qty: int,
+        price: float,
+        now: float | None = None,
+    ) -> Fill:
+        """Executes an RFQ fill: a bilaterally agreed price between two
+        specific accounts, bypassing the book entirely (there's no book
+        crossing to do — the price was already negotiated over the RFQ,
+        not discovered by matching). Still runs the exact same risk check
+        (MAX_POSITION, frozen account) and ledger/fee accounting as a
+        normal fill, and produces a real Fill row through the same
+        on_fill hook, so it's indistinguishable from a book trade in
+        /fills, persistence, and volume stats — it just has no backing
+        Order (maker_order_id/taker_order_id are 0, same sentinel
+        settle_fill uses for its own orderless fills).
+
+        The RFQ provider is always the maker (they supplied liquidity by
+        quoting a firm price) and the requester the taker, for fee
+        purposes — matching how a book fill assigns roles.
+        """
+        if product not in self.products:
+            raise OrderRejected(f"unknown product {product}")
+        if not isinstance(qty, int) or qty <= 0:
+            raise OrderRejected("qty must be a positive integer")
+        requester = self.accounts.get(requester_account_id)
+        provider = self.accounts.get(provider_account_id)
+        if requester is None:
+            raise OrderRejected(f"unknown account {requester_account_id}")
+        if provider is None:
+            raise OrderRejected(f"unknown account {provider_account_id}")
+        if requester.frozen:
+            raise OrderRejected("account is frozen")
+        if provider.frozen:
+            raise OrderRejected("account is frozen")
+
+        product_cfg = self.products[product]
+        now_ts = now if now is not None else time.time()
+        self._check_max_position(requester, product, product_cfg, requester_side, qty, now_ts)
+        self._check_max_position(provider, product, product_cfg, requester_side.opposite, qty, now_ts)
+
+        ledger.apply_fill(requester, product, requester_side, qty, price)
+        ledger.apply_fill(provider, product, requester_side.opposite, qty, price)
+
+        notional = price * qty
+        provider.cash -= notional * self.maker_fee_bps / 10_000
+        requester.cash -= notional * self.taker_fee_bps / 10_000
+
+        fill = Fill(
+            id=next_fill_id(),
+            product=product,
+            price=price,
+            qty=qty,
+            timestamp=now_ts,
+            maker_order_id=0,
+            taker_order_id=0,
+            maker_account_id=provider_account_id,
+            taker_account_id=requester_account_id,
+            taker_side=requester_side,
+        )
+        self.trade_tape.append(fill)
+        self.fills_by_account.setdefault(provider_account_id, []).append(fill)
+        if provider_account_id != requester_account_id:
+            self.fills_by_account.setdefault(requester_account_id, []).append(fill)
+        self.volume_qty[product] = self.volume_qty.get(product, 0) + qty
+        self.volume_notional[product] = self.volume_notional.get(product, 0.0) + notional
         if self._on_fill is not None:
             self._on_fill(fill)
         return fill

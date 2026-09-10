@@ -10,6 +10,8 @@ from exchange.config import (
     MMBotDefaults,
     MMBotsConfig,
     NetworkConfig,
+    NoiseBotDefaults,
+    NoiseBotsConfig,
     OptionsChainConfig,
     ProductConfig,
     RateLimitConfig,
@@ -75,6 +77,10 @@ def make_config(random_events_enabled=True, mean_interval=240.0):
             enabled_default=False, underlyings=("BTC-MINI", "ETH-MINI"), window_seconds=3600.0, num_live=5, tick_size=0.10,
         ),
         mm_bots=MMBotsConfig(default=mm_defaults, options=mm_defaults, futures=mm_defaults),
+        noise_bots=NoiseBotsConfig(
+            options=NoiseBotDefaults(count=2, arrival_rate_per_sec=0.2, max_size=2),
+            futures=NoiseBotDefaults(count=2, arrival_rate_per_sec=0.2, max_size=2),
+        ),
         insider_bots=InsiderBotsConfig(enabled_default=False, count=2, lead_seconds=5.0, size=5, hold_after_seconds=8.0),
     )
 

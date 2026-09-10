@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass
 
 from .bots import BotManager
-from .config import FuturesConfig, MMBotDefaults, ProductConfig
+from .config import FuturesConfig, MMBotDefaults, NoiseBotDefaults, ProductConfig
 from .engine import MatchingEngine, OrderRejected
 from .index_feed import IndexPriceService
 from .models import Side
@@ -49,12 +49,14 @@ class FuturesChainManager:
         bot_manager: BotManager,
         cfg: FuturesConfig,
         mm_cfg: MMBotDefaults,
+        noise_cfg: NoiseBotDefaults | None = None,
     ):
         self.engine = engine
         self.index_service = index_service
         self.bot_manager = bot_manager
         self.cfg = cfg
         self.mm_cfg = mm_cfg
+        self.noise_cfg = noise_cfg
         self.contracts: dict[str, dict[str, FutureInstrument]] = {u: {} for u in cfg.underlyings}
         self.calendar_spreads: dict[str, dict[str, CalendarSpreadInstrument]] = {u: {} for u in cfg.underlyings}
 
@@ -103,6 +105,16 @@ class FuturesChainManager:
             requote_interval=self.mm_cfg.requote_interval,
         )
 
+    def _spawn_noise_bots(self, symbol: str) -> None:
+        if self.noise_cfg is None:
+            return
+        for i in range(self.noise_cfg.count):
+            self.bot_manager.spawn_noise_bot(
+                symbol,
+                arrival_rate_per_sec=self.noise_cfg.arrival_rate_per_sec + 0.1 * i,
+                max_size=self.noise_cfg.max_size,
+            )
+
     def create_contract(self, underlying: str, now: float, expiry_ts: float) -> str:
         spot = self.index_service.get_index_price(underlying, now)
         symbol = self._contract_symbol(underlying, expiry_ts)
@@ -118,6 +130,7 @@ class FuturesChainManager:
         self.index_service.add_product(product_cfg)
         self.contracts[underlying][symbol] = FutureInstrument(symbol=symbol, underlying=underlying, expiry_ts=expiry_ts)
         self._spawn_mm_bot(symbol)
+        self._spawn_noise_bots(symbol)
         return symbol
 
     def _retire_calendar_spread(self, cs: CalendarSpreadInstrument) -> None:
@@ -129,6 +142,7 @@ class FuturesChainManager:
                 except OrderRejected:
                     pass
         self.bot_manager.remove_mm_bot(cs.symbol)
+        self.bot_manager.remove_noise_bots(cs.symbol)
         self.engine.remove_product(cs.symbol)
         self.index_service.remove_product(cs.symbol)
         self.calendar_spreads[cs.underlying].pop(cs.symbol, None)
@@ -154,6 +168,7 @@ class FuturesChainManager:
                 symbol=symbol, underlying=underlying, near_symbol=near.symbol, far_symbol=far.symbol,
             )
             self._spawn_mm_bot(symbol)
+            self._spawn_noise_bots(symbol)
 
     def _settle_and_retire_future(self, fut: FutureInstrument, now: float) -> None:
         settlement = self.index_service.get_index_price(fut.underlying, now)
@@ -175,6 +190,7 @@ class FuturesChainManager:
                     pass
 
         self.bot_manager.remove_mm_bot(fut.symbol)
+        self.bot_manager.remove_noise_bots(fut.symbol)
         self.engine.remove_product(fut.symbol)
         self.index_service.remove_product(fut.symbol)
         self.contracts[fut.underlying].pop(fut.symbol, None)
