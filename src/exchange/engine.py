@@ -118,6 +118,7 @@ class MatchingEngine:
         taker_fee_bps: float = 2.0,
         on_fill: Callable[[Fill], None] | None = None,
         on_order: Callable[[Order], None] | None = None,
+        mark_price_fn: Callable[[str, float], float | None] | None = None,
     ):
         # Optional persistence hooks (default no-op) — called at the exact
         # points a Fill/Order is created or has its status change, so a
@@ -128,6 +129,13 @@ class MatchingEngine:
         # student fill still moves a real student's cash.
         self._on_fill = on_fill
         self._on_order = on_order
+        # Balance-relative MAX_POSITION (see ledger.max_position_for) needs
+        # a current mark price to size against — supplied by the caller
+        # (state.py wires this to IndexPriceService.get_index_price) since
+        # the engine itself has no price feed of its own. None (e.g. in
+        # tests that construct a bare MatchingEngine) falls back to each
+        # product's configured starting_price.
+        self.mark_price_fn = mark_price_fn
         # Copied, not aliased: add_product/remove_product mutate this dict
         # at runtime (dynamic option contracts, the spread instrument), and
         # must never leak those changes back into the caller's own dict —
@@ -242,6 +250,7 @@ class MatchingEngine:
             raise OrderRejected("account is frozen")
 
         product_cfg = self.products[product]
+        now_ts = now if now is not None else time.time()
         if account_id not in self.unlimited_position_accounts:
             pos = account.position_for(product)
             # Worst case exposure: current filled position, plus every resting
@@ -251,9 +260,18 @@ class MatchingEngine:
             resting = self.resting_orders_by_account_product.get(account_id, {}).get(product, {})
             committed = pos.qty + sum(o.side.sign * o.remaining_qty for o in resting.values())
             prospective = committed + side.sign * qty
-            if abs(prospective) > product_cfg.max_position:
+            mark_price = self.mark_price_fn(product, now_ts) if self.mark_price_fn else None
+            if mark_price is None:
+                # Same contract-scaling IndexPriceService.on_raw_tick applies
+                # to every real tick — starting_price alone is the *raw*
+                # underlying price for a base product (e.g. BTC-MINI's
+                # 77500.0), not the ~77.5 contract-notional price everything
+                # else in this cap is denominated in.
+                mark_price = product_cfg.starting_price * product_cfg.contract_size
+            max_position = ledger.max_position_for(account.cash, product_cfg.leverage, mark_price)
+            if abs(prospective) > max_position:
                 raise OrderRejected(
-                    f"order would breach MAX_POSITION ({product_cfg.max_position}) for {product}"
+                    f"order would breach MAX_POSITION ({max_position}, {product_cfg.leverage}x balance) for {product}"
                 )
 
         order = Order(
@@ -266,7 +284,7 @@ class MatchingEngine:
             price=price,
             remaining_qty=qty,
             status=OrderStatus.OPEN,
-            timestamp=now if now is not None else time.time(),
+            timestamp=now_ts,
         )
         self.orders[order.id] = order
         self.orders_by_account.setdefault(account_id, {})[order.id] = order

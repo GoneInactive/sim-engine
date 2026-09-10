@@ -5,10 +5,15 @@ from exchange.config import (
     Config,
     FeedConfig,
     FeesConfig,
+    FuturesConfig,
+    InsiderBotsConfig,
+    MMBotDefaults,
+    MMBotsConfig,
     NetworkConfig,
-    OptionsConfig,
+    OptionsChainConfig,
     ProductConfig,
     RateLimitConfig,
+    RiskConfig,
     ServiceNetwork,
     SpreadInstrumentConfig,
     SyntheticFeedConfig,
@@ -28,17 +33,22 @@ def make_config(random_events_enabled=True, mean_interval=240.0):
     )
     products = {
         "BTC-MINI": ProductConfig(
-            symbol="BTC-MINI", underlying="BTC/USD", contract_size=0.001, max_position=15,
+            symbol="BTC-MINI", underlying="BTC/USD", contract_size=0.001,
             tick_size=0.05, starting_price=80000.0, annual_volatility=0.5, annual_drift=0.0,
         ),
         "ETH-MINI": ProductConfig(
-            symbol="ETH-MINI", underlying="ETH/USD", contract_size=0.03, max_position=15,
+            symbol="ETH-MINI", underlying="ETH/USD", contract_size=0.03,
             tick_size=0.05, starting_price=2500.0, annual_volatility=0.7, annual_drift=0.0,
         ),
     }
+    mm_defaults = MMBotDefaults(
+        legs=3, min_spread_ticks=2.0, delta_ticks=1.0, quote_size=3, skew_sensitivity=0.05, requote_interval=1.5,
+    )
     return Config(
+        exchange_name="miniX",
         network=network,
         database_url="sqlite://",
+        risk=RiskConfig(default_leverage=5.0),
         products=products,
         accounts=AccountsConfig(starting_cash=1000.0, enforce_buying_power=False, freeze_on_zero_equity=False),
         feed=FeedConfig(stale_threshold_seconds=7, sma_window=20, reconnect_blend_seconds=7, shock_decay_seconds=7),
@@ -53,12 +63,19 @@ def make_config(random_events_enabled=True, mean_interval=240.0):
         website_password="site-pw",
         spread=SpreadInstrumentConfig(
             enabled_default=False, symbol="BTC-ETH-MINI", btc_product="BTC-MINI", eth_product="ETH-MINI",
-            contract_size=1.0, max_position=15, tick_size=0.10,
+            contract_size=1.0, tick_size=0.10,
         ),
-        options=OptionsConfig(
-            enabled_default=False, underlying="BTC-MINI", window_seconds=900.0, strikes_each_side=5,
-            strike_increment=500.0, implied_volatility=0.55, contract_size=0.001, max_position=15, tick_size=0.10,
+        options={
+            "btc": OptionsChainConfig(
+                id="btc", enabled_default=False, underlying="BTC-MINI", window_seconds=900.0, strikes_each_side=5,
+                strike_increment=500.0, implied_volatility=0.55, contract_size=0.001, tick_size=0.10,
+            ),
+        },
+        futures=FuturesConfig(
+            enabled_default=False, underlyings=("BTC-MINI", "ETH-MINI"), window_seconds=3600.0, num_live=5, tick_size=0.10,
         ),
+        mm_bots=MMBotsConfig(default=mm_defaults, options=mm_defaults, futures=mm_defaults),
+        insider_bots=InsiderBotsConfig(enabled_default=False, count=2, lead_seconds=5.0, size=5, hold_after_seconds=8.0),
     )
 
 
@@ -132,9 +149,33 @@ def test_random_event_scheduler_fires_a_recognized_kind():
     scheduler = RandomEventScheduler(svc, DummyBotManager(), config)
     random.seed(7)
     for _ in range(20):
-        scheduler._fire_one()
+        scheduler._schedule_next()
+        scheduler._fire_scheduled()
 
     # at least one event of some kind should have been registered as an
     # index_service offset event or a liquidity call
     total_offset_events = sum(len(v) for v in svc.events.values())
     assert total_offset_events > 0 or calls
+
+
+def test_peek_next_event_exposes_committed_kind_before_firing():
+    config = make_config()
+    svc = IndexPriceService(config.feed, config.products)
+
+    class DummyBotManager:
+        def trigger_liquidity_event(self, *a, **k):
+            pass
+
+    scheduler = RandomEventScheduler(svc, DummyBotManager(), config)
+    assert scheduler.peek_next_event() is None
+
+    random.seed(3)
+    scheduler._schedule_next()
+    peeked = scheduler.peek_next_event()
+    assert peeked is not None
+    assert peeked["kind"] == scheduler.next_event_kind
+    assert peeked["product"] == scheduler.next_event_product
+    assert peeked["direction"] in (1, -1)
+
+    scheduler._fire_scheduled()
+    assert scheduler.peek_next_event() is None

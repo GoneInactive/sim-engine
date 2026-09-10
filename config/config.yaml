@@ -1,4 +1,4 @@
-# Mini-Exchange config.
+# miniX config.
 #
 # Network settings live here so the same code runs unchanged from a laptop
 # (127.0.0.1) to the Hetzner VM later — just edit `host` values (or override
@@ -6,6 +6,8 @@
 #
 # Env var overrides (useful for docker-compose / prod) take precedence over
 # the values in this file. See src/exchange/config.py for the full mapping.
+
+exchange_name: "miniX"
 
 network:
   # Bind address for each service. Use 0.0.0.0 to accept connections from
@@ -52,11 +54,18 @@ synthetic_feed:
   # across both products combined.
   random_event_mean_interval_seconds: 240
 
+# Every position cap below (products/spread/options/futures) is now
+# relative to an account's live balance rather than a fixed contract count:
+# max_position = floor(cash * leverage / mark_price), where mark_price is
+# the instrument's current contract-scaled index price. `default_leverage`
+# applies to any instrument that doesn't set its own `leverage:` override.
+risk:
+  default_leverage: 5.0
+
 products:
   BTC-MINI:
     underlying: "BTC/USD"
     contract_size: 0.001
-    max_position: 150
     tick_size: 0.10
     # Underlying (pre contract-size-scaling) starting price and annualized
     # GBM volatility/drift driving the synthetic index (see synthetic_feed
@@ -67,7 +76,6 @@ products:
   ETH-MINI:
     underlying: "ETH/USD"
     contract_size: 0.03
-    max_position: 150
     tick_size: 0.10
     starting_price: 2430.0
     annual_volatility: 0.70
@@ -85,39 +93,120 @@ spread:
   btc_product: "BTC-MINI"
   eth_product: "ETH-MINI"
   contract_size: 1.0
-  max_position: 250
   tick_size: 0.10
 
-# 15-minute European BTC options. A fresh strike chain (calls + puts around
-# ATM) is generated automatically every window_seconds while enabled, priced
-# by a per-contract market-maker bot quoting around a Black-Scholes theo
-# (see src/exchange/options.py), and cash-settled against the underlying's
-# index price at expiry. Admin can enable/disable at any time; disabling
-# stops new chains from being created but lets any in-flight chain settle
-# normally rather than stranding open positions.
+# 1-hour rolling futures + calendar spreads, one ladder per underlying.
+# `num_live` contracts are always kept live per underlying, each expiring
+# `window_seconds` apart (a rolling ladder, not a shared clock-aligned
+# window like the options chain below) — when the front contract expires
+# it's cash-settled at the underlying's index price and a new far contract
+# is added to keep `num_live` live. Calendar spreads are auto-registered
+# between each adjacent pair of live contracts (near - far, both already
+# contract-scaled) and rebuilt whenever a chain rolls. Displayed together
+# as the Inter-Spread matrix on the website.
+futures:
+  enabled_default: false
+  underlyings: ["BTC-MINI", "ETH-MINI"]
+  window_seconds: 3600
+  num_live: 5
+  tick_size: 0.10
+
+# Rolling option chains. Each entry is an independent chain (own underlying,
+# own window/strikes/vol), generated automatically every window_seconds
+# while enabled, priced by a per-contract market-maker bot quoting around a
+# Black-Scholes theo (see src/exchange/options.py), and cash-settled against
+# the underlying's index price at expiry. Admin can enable/disable each
+# chain independently; disabling stops new chains from being created but
+# lets any in-flight chain settle normally rather than stranding positions.
 #
 # strike_increment is in the underlying's own *contract-scaled* index-price
 # units (the same ~77.5 space BTC-MINI itself quotes in, i.e. real BTC/USD
-# price * BTC-MINI's contract_size) — not raw BTC/USD dollars. 1.0 here
-# spaces strikes about $1000 apart in real BTC/USD terms.
+# price * BTC-MINI's contract_size) — not raw underlying dollars.
 options:
+  btc:
+    enabled_default: false
+    underlying: "BTC-MINI"
+    window_seconds: 600
+    strikes_each_side: 5
+    strike_increment: 1.0
+    implied_volatility: 0.55
+    # 1.0, not BTC-MINI's own 0.001: price_tick() already feeds a fully
+    # contract-scaled Black-Scholes theo straight into on_raw_tick, which
+    # itself multiplies by contract_size again — anything but 1.0 here
+    # silently rescales every option's price a second time.
+    contract_size: 1.0
+    # A 15-minute option's extrinsic value is genuinely tiny in this
+    # contract-scaled price space (BS time value ~$0.09 even ATM, per
+    # build/verification notes) — a coarser tick would round most of the
+    # chain's bid side down to zero and make it untradeable.
+    tick_size: 0.01
+  eth:
+    enabled_default: false
+    underlying: "ETH-MINI"
+    window_seconds: 600
+    strikes_each_side: 5
+    strike_increment: 0.5
+    implied_volatility: 0.70
+    contract_size: 1.0
+    tick_size: 0.01
+  btc_eth_spread:
+    # Options on the BTC-ETH-MINI cross-product spread itself (see `spread`
+    # above) — same mechanics, underlying is the spread's own index price
+    # (which can be negative, so strikes straddle 0 rather than being
+    # ATM-anchored to a positive spot).
+    enabled_default: false
+    underlying: "BTC-ETH-MINI"
+    window_seconds: 900
+    strikes_each_side: 5
+    strike_increment: 1.0
+    implied_volatility: 0.65
+    contract_size: 1.0
+    tick_size: 0.01
+
+# Simplified market-maker bots: one bot per product/contract. `legs` bid/ask
+# pairs are quoted per side, leg i sitting min_spread_ticks + i*delta_ticks
+# ticks away from mid on each side (e.g. min_spread_ticks=2, delta_ticks=1,
+# legs=4 -> legs at 2,3,4,5 ticks from mid, i.e. 4,6,8,10-tick bid/ask
+# spreads). `default` applies to every base product plus the BTC-ETH spread;
+# `options`/`futures` apply to every contract/calendar-spread spawned by
+# those chains.
+mm_bots:
+  default:
+    legs: 3
+    min_spread_ticks: 2
+    delta_ticks: 1.5
+    quote_size: 3
+    skew_sensitivity: 0.05
+    requote_interval: 1.5
+  options:
+    legs: 2
+    min_spread_ticks: 2
+    delta_ticks: 2
+    quote_size: 3
+    skew_sensitivity: 0.05
+    requote_interval: 1.5
+  futures:
+    legs: 3
+    min_spread_ticks: 2
+    delta_ticks: 1.5
+    quote_size: 3
+    skew_sensitivity: 0.05
+    requote_interval: 1.5
+
+# "Insider" bots — a teaching/surveillance exercise, not a real strategy:
+# each gets advance knowledge of the next scheduled random market event
+# (see synthetic_feed.RandomEventScheduler.peek_next_event) and trades
+# directionally `lead_seconds` before it fires, unwinding shortly after.
+# Off by default; when enabled, these accounts are ordinary (not exempt
+# from position limits) so their conspicuously well-timed P&L is something
+# students can practice spotting on the leaderboard/fills, not a bot that
+# quietly breaks the risk model.
+insider_bots:
   enabled_default: false
-  underlying: "BTC-MINI"
-  window_seconds: 600
-  strikes_each_side: 5
-  strike_increment: 1.0
-  implied_volatility: 0.55
-  # 1.0, not BTC-MINI's own 0.001: price_tick() already feeds a fully
-  # contract-scaled Black-Scholes theo straight into on_raw_tick, which
-  # itself multiplies by contract_size again — anything but 1.0 here
-  # silently rescales every option's price a second time.
-  contract_size: 1.0
-  max_position: 75
-  # A 15-minute option's extrinsic value is genuinely tiny in this
-  # contract-scaled price space (BS time value ~$0.09 even ATM, per
-  # build/verification notes) — a coarser tick would round most of the
-  # chain's bid side down to zero and make it untradeable.
-  tick_size: 0.01
+  count: 2
+  lead_seconds: 5.0
+  size: 5
+  hold_after_seconds: 8.0
 
 accounts:
   starting_cash: 1000.0

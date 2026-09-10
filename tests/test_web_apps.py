@@ -41,7 +41,7 @@ def test_admin_page_renders():
     client = TestClient(create_admin_app(state))
     r = client.get("/", headers=basic_auth_header(state.config.admin_password))
     assert r.status_code == 200
-    assert "Mini-Exchange Admin" in r.text
+    assert "miniX Admin" in r.text
     assert "BTC-MINI" in r.text
 
 

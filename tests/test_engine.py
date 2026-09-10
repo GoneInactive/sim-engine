@@ -6,9 +6,14 @@ from exchange.models import OrderStatus, OrderType, Side
 
 PRODUCTS = {
     "BTC-MINI": ProductConfig(
-        symbol="BTC-MINI", underlying="BTC/USD", contract_size=0.001, max_position=15, tick_size=0.05
+        symbol="BTC-MINI", underlying="BTC/USD", contract_size=0.001, tick_size=0.05, starting_price=75000.0,
     )
 }
+# With no mark_price_fn wired, MAX_POSITION falls back to
+# starting_price * contract_size (75000 * 0.001 == 75, matching how a real
+# base product's raw starting_price gets contract-scaled) at the default
+# 5x leverage: floor(1000 * 5 / 75) == 66.
+MAX_POSITION_AT_1000_CASH = 66
 
 
 def make_engine():
@@ -81,17 +86,27 @@ def test_market_order_is_ioc_and_never_rests():
 
 def test_max_position_rejects_at_acceptance():
     engine = make_engine()
-    engine.submit_order("alice", "BTC-MINI", Side.BUY, OrderType.LIMIT, 15, 70.0)
+    engine.submit_order("alice", "BTC-MINI", Side.BUY, OrderType.LIMIT, MAX_POSITION_AT_1000_CASH, 70.0)
     with pytest.raises(OrderRejected):
         engine.submit_order("alice", "BTC-MINI", Side.BUY, OrderType.LIMIT, 1, 70.0)
+
+
+def test_max_position_is_relative_to_balance():
+    # Same product/price, but a much richer account should be allowed a
+    # much bigger position — this is the whole point of the balance-
+    # relative cap replacing the old fixed MAX_POSITION int.
+    engine = make_engine()
+    engine.get_or_create_account("richie", 100_000.0)
+    order = engine.submit_order("richie", "BTC-MINI", Side.BUY, OrderType.LIMIT, MAX_POSITION_AT_1000_CASH * 10, 70.0)
+    assert order.status == OrderStatus.OPEN
 
 
 def test_unlimited_position_account_bypasses_max_position():
     engine = make_engine()
     engine.unlimited_position_accounts.add("alice")
-    engine.submit_order("alice", "BTC-MINI", Side.BUY, OrderType.LIMIT, 15, 70.0)
-    # would normally be rejected — MAX_POSITION for BTC-MINI is 15
-    order = engine.submit_order("alice", "BTC-MINI", Side.BUY, OrderType.LIMIT, 50, 70.0)
+    engine.submit_order("alice", "BTC-MINI", Side.BUY, OrderType.LIMIT, MAX_POSITION_AT_1000_CASH, 70.0)
+    # would normally be rejected at this account's balance-relative cap
+    order = engine.submit_order("alice", "BTC-MINI", Side.BUY, OrderType.LIMIT, 500, 70.0)
     assert order.status == OrderStatus.OPEN
 
 

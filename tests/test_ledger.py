@@ -1,4 +1,4 @@
-from exchange.ledger import apply_fill, equity, unrealized_pnl, would_breach_max_position
+from exchange.ledger import apply_adjustment, apply_fill, equity, max_position_for, unrealized_pnl, would_breach_max_position
 from exchange.models import Account, Position, Side
 
 
@@ -81,3 +81,26 @@ def test_would_breach_max_position():
     assert would_breach_max_position(pos, Side.BUY, 3, max_position=15) is True
     assert would_breach_max_position(pos, Side.BUY, 2, max_position=15) is False
     assert would_breach_max_position(pos, Side.SELL, 30, max_position=15) is True
+
+
+def test_max_position_for_scales_with_balance_and_leverage():
+    assert max_position_for(cash=1000.0, leverage=5.0, mark_price=100.0) == 50
+    assert max_position_for(cash=2000.0, leverage=5.0, mark_price=100.0) == 100
+    assert max_position_for(cash=1000.0, leverage=10.0, mark_price=100.0) == 100
+
+
+def test_max_position_for_floors_at_one_with_positive_cash():
+    assert max_position_for(cash=1.0, leverage=1.0, mark_price=1000.0) == 1
+
+
+def test_max_position_for_zero_without_a_price():
+    assert max_position_for(cash=1000.0, leverage=5.0, mark_price=None) == 0
+
+
+def test_apply_adjustment_moves_cash_directly():
+    acc = Account(id="a1", cash=1000.0)
+    new_cash = apply_adjustment(acc, 250.0)
+    assert new_cash == 1250.0
+    assert acc.cash == 1250.0
+    apply_adjustment(acc, -300.0)
+    assert acc.cash == 950.0

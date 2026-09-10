@@ -27,6 +27,11 @@ class RegisterIn(BaseModel):
     account_id: str
 
 
+class AdjustBalanceIn(BaseModel):
+    delta: float
+    reason: str = ""
+
+
 class ShockIn(BaseModel):
     product: str
     target_offset: float
@@ -67,17 +72,21 @@ class ReplaySpeedIn(BaseModel):
 
 
 class BotParamsIn(BaseModel):
-    base_spread_frac: Optional[float] = None
+    legs: Optional[int] = None
+    min_spread_ticks: Optional[float] = None
+    delta_ticks: Optional[float] = None
     quote_size: Optional[int] = None
     active: Optional[bool] = None
 
 
 class SpawnBotIn(BaseModel):
     product: str
-    base_spread_frac: float = 0.004
+    legs: int = 3
+    min_spread_ticks: float = 2.0
+    delta_ticks: float = 1.0
     quote_size: int = 3
     skew_sensitivity: float = 0.05
-    requote_interval: float = 2.0
+    requote_interval: float = 1.5
 
 
 class SpawnNoiseBotIn(BaseModel):
@@ -99,6 +108,19 @@ class ArbBotParamsIn(BaseModel):
     active: Optional[bool] = None
 
 
+class SpawnInsiderBotIn(BaseModel):
+    lead_seconds: float = 5.0
+    size: int = 5
+    hold_after_seconds: float = 8.0
+
+
+class InsiderBotParamsIn(BaseModel):
+    lead_seconds: Optional[float] = None
+    size: Optional[int] = None
+    hold_after_seconds: Optional[float] = None
+    active: Optional[bool] = None
+
+
 class SyntheticParamsIn(BaseModel):
     product: str
     annual_volatility: Optional[float] = None
@@ -114,7 +136,7 @@ class EnabledIn(BaseModel):
 
 
 def create_admin_app(state: AppState) -> FastAPI:
-    app = FastAPI(title="Mini-Exchange Admin API")
+    app = FastAPI(title=f"{state.config.exchange_name} Admin API")
 
     def admin_auth(
         x_admin_password: Optional[str] = Header(default=None),
@@ -193,6 +215,14 @@ def create_admin_app(state: AppState) -> FastAPI:
         _log_frozen(account_id, False)
         return {"account_id": account_id, "frozen": False}
 
+    @app.post("/accounts/{account_id}/adjust_balance", dependencies=[Depends(admin_auth)])
+    def adjust_balance(account_id: str, body: AdjustBalanceIn):
+        try:
+            new_cash = state.adjust_balance(account_id, body.delta, body.reason)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="no such account")
+        return {"account_id": account_id, "delta": body.delta, "reason": body.reason, "cash": new_cash}
+
     @app.get("/accounts/{account_id}/orders", dependencies=[Depends(admin_auth)])
     def list_account_orders(account_id: str):
         return [
@@ -258,8 +288,12 @@ def create_admin_app(state: AppState) -> FastAPI:
     def set_bot_params(account_id: str, body: BotParamsIn):
         for bot in state.bot_manager.mm_bots:
             if bot.config.account_id == account_id:
-                if body.base_spread_frac is not None:
-                    bot.config.base_spread_frac = body.base_spread_frac
+                if body.legs is not None:
+                    bot.config.legs = body.legs
+                if body.min_spread_ticks is not None:
+                    bot.config.min_spread_ticks = body.min_spread_ticks
+                if body.delta_ticks is not None:
+                    bot.config.delta_ticks = body.delta_ticks
                 if body.quote_size is not None:
                     bot.config.quote_size = body.quote_size
                 if body.active is not None:
@@ -269,10 +303,11 @@ def create_admin_app(state: AppState) -> FastAPI:
 
     @app.post("/bots", dependencies=[Depends(admin_auth)])
     def spawn_bot(body: SpawnBotIn):
-        if body.product not in state.config.products:
+        if body.product not in state.engine.products:
             raise HTTPException(status_code=400, detail="unknown product")
         bot = state.bot_manager.spawn_mm_bot(
-            body.product, body.base_spread_frac, body.quote_size, body.skew_sensitivity, body.requote_interval
+            body.product, body.legs, body.min_spread_ticks, body.delta_ticks,
+            body.quote_size, body.skew_sensitivity, body.requote_interval,
         )
         return {"account_id": bot.config.account_id, "product": bot.product, "config": bot.config.__dict__}
 
@@ -353,6 +388,48 @@ def create_admin_app(state: AppState) -> FastAPI:
                 return {"account_id": account_id, "config": bot.config.__dict__}
         raise HTTPException(status_code=404, detail="no such arb bot")
 
+    # -- insider bots ---------------------------------------------------------
+    @app.post("/bots/insider", dependencies=[Depends(admin_auth)])
+    def spawn_insider_bot(body: SpawnInsiderBotIn):
+        bot = state.bot_manager.spawn_insider_bot(body.lead_seconds, body.size, body.hold_after_seconds)
+        return {"account_id": bot.config.account_id, "config": bot.config.__dict__}
+
+    @app.get("/bots/insider", dependencies=[Depends(admin_auth)])
+    def list_insider_bots():
+        out = []
+        for b in state.bot_manager.insider_bots:
+            account = state.engine.accounts.get(b.config.account_id)
+            starting_cash = state.starting_cash_by_account.get(
+                b.config.account_id, state.bot_manager.starting_cash * 10
+            )
+            fills = state.engine.fills_by_account.get(b.config.account_id, [])[-10:][::-1]
+            out.append({
+                "account_id": b.config.account_id,
+                "config": b.config.__dict__,
+                "cash": account.cash if account else None,
+                "realized_pnl": (account.cash - starting_cash) if account else None,
+                "recent_fills": [
+                    {"product": f.product, "price": f.price, "qty": f.qty, "timestamp": f.timestamp, "taker_side": f.taker_side.value}
+                    for f in fills
+                ],
+            })
+        return out
+
+    @app.post("/bots/insider/{account_id}/params", dependencies=[Depends(admin_auth)])
+    def set_insider_bot_params(account_id: str, body: InsiderBotParamsIn):
+        for bot in state.bot_manager.insider_bots:
+            if bot.config.account_id == account_id:
+                if body.lead_seconds is not None:
+                    bot.config.lead_seconds = body.lead_seconds
+                if body.size is not None:
+                    bot.config.size = body.size
+                if body.hold_after_seconds is not None:
+                    bot.config.hold_after_seconds = body.hold_after_seconds
+                if body.active is not None:
+                    bot.config.active = body.active
+                return {"account_id": account_id, "config": bot.config.__dict__}
+        raise HTTPException(status_code=404, detail="no such insider bot")
+
     @app.get("/accounts", dependencies=[Depends(admin_auth)])
     def list_accounts():
         return [
@@ -362,7 +439,7 @@ def create_admin_app(state: AppState) -> FastAPI:
 
     @app.get("/market/{product}", dependencies=[Depends(admin_auth)])
     def market_snapshot(product: str):
-        if product not in state.config.products:
+        if product not in state.engine.products:
             raise HTTPException(status_code=404, detail="unknown product")
         return state.market_snapshot(product)
 
@@ -375,26 +452,54 @@ def create_admin_app(state: AppState) -> FastAPI:
     def set_spread_instrument_enabled(body: EnabledIn):
         return {"symbol": state.config.spread.symbol, "enabled": state.set_spread_enabled(body.enabled)}
 
-    @app.get("/instruments/options", dependencies=[Depends(admin_auth)])
-    def get_options_instrument():
+    @app.get("/instruments/futures", dependencies=[Depends(admin_auth)])
+    def get_futures_instrument():
         now = time.time()
-        contracts = []
-        for opt in sorted(state.options_manager.chain.values(), key=lambda o: (o.strike, o.option_type)):
-            book = state.engine.book_snapshot(opt.symbol, depth=1)
-            contracts.append({
-                "symbol": opt.symbol,
-                "strike": opt.strike,
-                "option_type": opt.option_type,
-                "expiry_ts": opt.expiry_ts,
-                "theo": state.index_service.get_index_price(opt.symbol, now),
-                "bid": book["bids"][0]["price"] if book["bids"] else None,
-                "ask": book["asks"][0]["price"] if book["asks"] else None,
-            })
-        return {"enabled": state.options_enabled, "underlying": state.config.options.underlying, "contracts": contracts}
+        out = {}
+        for underlying in state.config.futures.underlyings:
+            contracts = sorted(state.futures_manager.contracts[underlying].values(), key=lambda f: f.expiry_ts)
+            spreads = sorted(state.futures_manager.calendar_spreads[underlying].values(), key=lambda c: c.symbol)
+            out[underlying] = {
+                "futures": [
+                    {"symbol": f.symbol, "expiry_ts": f.expiry_ts, "last": state.index_service.get_index_price(f.symbol, now)}
+                    for f in contracts
+                ],
+                "calendar_spreads": [
+                    {"symbol": c.symbol, "near": c.near_symbol, "far": c.far_symbol, "last": state.index_service.get_index_price(c.symbol, now)}
+                    for c in spreads
+                ],
+            }
+        return {"enabled": state.futures_enabled, "underlyings": out}
 
-    @app.post("/instruments/options/enabled", dependencies=[Depends(admin_auth)])
-    def set_options_instrument_enabled(body: EnabledIn):
-        return {"enabled": state.set_options_enabled(body.enabled)}
+    @app.post("/instruments/futures/enabled", dependencies=[Depends(admin_auth)])
+    def set_futures_instrument_enabled(body: EnabledIn):
+        return {"enabled": state.set_futures_enabled(body.enabled)}
+
+    @app.get("/instruments/options", dependencies=[Depends(admin_auth)])
+    def get_options_instruments():
+        now = time.time()
+        out = {}
+        for chain_id, manager in state.options_managers.items():
+            contracts = []
+            for opt in sorted(manager.chain.values(), key=lambda o: (o.strike, o.option_type)):
+                book = state.engine.book_snapshot(opt.symbol, depth=1)
+                contracts.append({
+                    "symbol": opt.symbol,
+                    "strike": opt.strike,
+                    "option_type": opt.option_type,
+                    "expiry_ts": opt.expiry_ts,
+                    "theo": state.index_service.get_index_price(opt.symbol, now),
+                    "bid": book["bids"][0]["price"] if book["bids"] else None,
+                    "ask": book["asks"][0]["price"] if book["asks"] else None,
+                })
+            out[chain_id] = {"enabled": state.options_enabled[chain_id], "underlying": manager.cfg.underlying, "contracts": contracts}
+        return out
+
+    @app.post("/instruments/options/{chain_id}/enabled", dependencies=[Depends(admin_auth)])
+    def set_options_instrument_enabled(chain_id: str, body: EnabledIn):
+        if chain_id not in state.options_managers:
+            raise HTTPException(status_code=404, detail="no such options chain")
+        return {"chain_id": chain_id, "enabled": state.set_options_enabled(chain_id, body.enabled)}
 
     @app.get("/", response_class=HTMLResponse, dependencies=[Depends(admin_auth)])
     def admin_page():
@@ -410,11 +515,14 @@ def create_admin_app(state: AppState) -> FastAPI:
 </div>"""
             for p in products
         )
+        options_chain_ids = list(state.options_managers.keys())
         return (
             ADMIN_PAGE.replace("__PRODUCT_OPTIONS__", product_options)
             .replace("__MARKET_COLS__", market_cols)
             .replace("__PRODUCTS_JSON__", str(products))
+            .replace("__OPTIONS_CHAIN_IDS_JSON__", str(options_chain_ids))
             .replace("__WEBSITE_URL__", state.config.network.website_base_url)
+            .replace("__EXCHANGE_NAME__", state.config.exchange_name)
         )
 
     return app
@@ -423,7 +531,7 @@ def create_admin_app(state: AppState) -> FastAPI:
 ADMIN_PAGE = """<!doctype html>
 <html>
 <head>
-<title>Mini-Exchange Admin</title>
+<title>__EXCHANGE_NAME__ Admin</title>
 <style>
   * { box-sizing:border-box; }
   body { background:#fff; color:#000; font-family: ui-monospace, monospace; margin:0; padding:24px; max-width:1000px; }
@@ -456,7 +564,7 @@ ADMIN_PAGE = """<!doctype html>
 </style>
 </head>
 <body>
-<h1>Mini-Exchange Admin</h1>
+<h1>__EXCHANGE_NAME__ Admin</h1>
 <nav><a href="__WEBSITE_URL__" target="_blank">Website</a></nav>
 
 <div class="tabs">
@@ -467,7 +575,9 @@ ADMIN_PAGE = """<!doctype html>
   <button class="tab-btn" data-tab="mmbots" onclick="showTab('mmbots')">MM bots</button>
   <button class="tab-btn" data-tab="noisebots" onclick="showTab('noisebots')">Noise bots</button>
   <button class="tab-btn" data-tab="arbbot" onclick="showTab('arbbot')">Arb bot</button>
+  <button class="tab-btn" data-tab="insiderbots" onclick="showTab('insiderbots')">Insider bots</button>
   <button class="tab-btn" data-tab="options" onclick="showTab('options')">Options</button>
+  <button class="tab-btn" data-tab="futures" onclick="showTab('futures')">Futures</button>
   <button class="tab-btn" data-tab="spread" onclick="showTab('spread')">Spread</button>
 </div>
 
@@ -501,6 +611,13 @@ ADMIN_PAGE = """<!doctype html>
     <button onclick="freezeAccount()">Freeze</button>
     <button onclick="unfreezeAccount()">Unfreeze</button>
     <button onclick="killOrders()">Kill orders</button>
+  </fieldset>
+  <fieldset>
+    <legend>Adjust balance</legend>
+    <label>Account ID<input id="adj-id"></label>
+    <label>Delta ($, negative = withdraw)<input id="adj-delta" value="100"></label>
+    <label>Reason<input id="adj-reason" placeholder="optional"></label>
+    <button onclick="adjustBalance()">Adjust balance</button>
   </fieldset>
 </div>
 <button onclick="loadAccounts()">Refresh account list</button>
@@ -575,27 +692,33 @@ ADMIN_PAGE = """<!doctype html>
 
 <div class="tab-panel" data-tab="mmbots" hidden>
 <h2>Market maker bots</h2>
+<p style="font-size:13px;">One bot per product/contract. <code>legs</code> bid/ask pairs are quoted per side; leg i sits
+<code>min_spread_ticks + i*delta_ticks</code> ticks wide.</p>
 <div class="row">
   <fieldset>
     <legend>Spawn MM bot</legend>
     <label>Product<select id="spawn-mm-product">__PRODUCT_OPTIONS__</select></label>
-    <label>Base spread frac<input id="spawn-mm-spread" value="0.004"></label>
+    <label>Legs<input id="spawn-mm-legs" value="3"></label>
+    <label>Min spread (ticks)<input id="spawn-mm-minspread" value="2"></label>
+    <label>Delta (ticks)<input id="spawn-mm-delta" value="1"></label>
     <label>Quote size<input id="spawn-mm-size" value="3"></label>
     <label>Skew sensitivity<input id="spawn-mm-skew" value="0.05"></label>
-    <label>Requote interval (s)<input id="spawn-mm-interval" value="2.0"></label>
+    <label>Requote interval (s)<input id="spawn-mm-interval" value="1.5"></label>
     <button onclick="spawnMmBot()">Spawn MM bot</button>
   </fieldset>
   <fieldset>
     <legend>Adjust MM bot</legend>
     <label>Bot account ID (e.g. mm_BTC-MINI_0)<input id="bot-id"></label>
-    <label>Base spread frac (blank = unchanged)<input id="bot-spread"></label>
+    <label>Legs (blank = unchanged)<input id="bot-legs"></label>
+    <label>Min spread ticks (blank = unchanged)<input id="bot-minspread"></label>
+    <label>Delta ticks (blank = unchanged)<input id="bot-delta"></label>
     <label>Quote size (blank = unchanged)<input id="bot-size"></label>
     <label>Active<select id="bot-active"><option value="">unchanged</option><option value="true">on</option><option value="false">off</option></select></label>
     <button onclick="setBotParams()">Update bot</button>
   </fieldset>
 </div>
 <button onclick="loadBots()">Refresh MM bot list</button>
-<table><thead><tr><th>Account</th><th>Product</th><th>Spread frac</th><th>Size</th><th>Active</th><th></th></tr></thead><tbody id="bots-table"></tbody></table>
+<table><thead><tr><th>Account</th><th>Product</th><th>Legs</th><th>Min/Delta ticks</th><th>Size</th><th>Active</th><th></th></tr></thead><tbody id="bots-table"></tbody></table>
 </div>
 
 <div class="tab-panel" data-tab="noisebots" hidden>
@@ -622,21 +745,48 @@ from fair value. One spawns per product automatically.</p>
 <table><thead><tr><th>Account</th><th>Product</th><th>Threshold (ticks)</th><th>Correction qty</th><th>Active</th><th></th></tr></thead><tbody id="arb-bots-table"></tbody></table>
 </div>
 
+<div class="tab-panel" data-tab="insiderbots" hidden>
+<h2>Insider bots</h2>
+<p style="font-size:13px;">Teaching/surveillance exercise, not a real strategy: each gets advance notice of the next
+scheduled random market event and trades directionally just before it fires, unwinding shortly after — practice
+spotting the conspicuously well-timed P&amp;L below. Ordinary accounts, subject to the same relative position limits
+as students.</p>
+<div class="row">
+  <fieldset>
+    <legend>Spawn insider bot</legend>
+    <label>Lead seconds (trades this long before the event)<input id="spawn-insider-lead" value="5"></label>
+    <label>Size (contracts)<input id="spawn-insider-size" value="5"></label>
+    <label>Hold after seconds (unwinds this long after)<input id="spawn-insider-hold" value="8"></label>
+    <button onclick="spawnInsiderBot()">Spawn insider bot</button>
+  </fieldset>
+</div>
+<button onclick="loadInsiderBots()">Refresh insider bot list</button>
+<table><thead><tr><th>Account</th><th>Lead (s)</th><th>Size</th><th>Cash</th><th>Realized PnL</th><th>Active</th><th></th><th>Recent fills</th></tr></thead><tbody id="insider-bots-table"></tbody></table>
+</div>
+
 <div class="tab-panel" data-tab="options" hidden>
-<h2>15-min BTC options <span class="badge" id="options-badge">?</span></h2>
-<p style="font-size:13px;">A fresh call/put strike chain around ATM is created automatically every window while enabled,
-priced by Black-Scholes and quoted by one MM bot per contract. Disabling stops new chains from being created but lets
-any chain already in flight settle normally. <a href="__WEBSITE_URL__/options" target="_blank">Open Options Chain page</a></p>
-<button onclick="setOptionsEnabled(true)">Enable</button>
-<button onclick="setOptionsEnabled(false)">Disable</button>
-<button onclick="loadOptions()">Refresh</button>
-<table><thead><tr><th>Symbol</th><th>Strike</th><th>Type</th><th>Theo</th><th>Bid</th><th>Ask</th></tr></thead><tbody id="options-table"></tbody></table>
+<h2>Option chains</h2>
+<p style="font-size:13px;">A fresh call/put strike chain around ATM is created automatically every window while a chain
+is enabled, priced by Black-Scholes and quoted by one MM bot per contract. Disabling stops new chains from being
+created but lets any chain already in flight settle normally.
+<a href="__WEBSITE_URL__/options" target="_blank">Open Options Chain page</a></p>
+<div id="options-chains"></div>
+</div>
+
+<div class="tab-panel" data-tab="futures" hidden>
+<h2>Futures &amp; calendar spreads <span class="badge" id="futures-badge">?</span></h2>
+<p style="font-size:13px;">5 rolling 1-hour futures contracts per underlying, plus calendar spreads between each
+adjacent pair. <a href="__WEBSITE_URL__/inter-spread" target="_blank">Open Inter-Spread matrix</a></p>
+<button onclick="setFuturesEnabled(true)">Enable</button>
+<button onclick="setFuturesEnabled(false)">Disable</button>
+<button onclick="loadFutures()">Refresh</button>
+<div id="futures-underlyings"></div>
 </div>
 
 <div class="tab-panel" data-tab="spread" hidden>
 <h2>BTC-ETH mini spread <span class="badge" id="spread-badge">?</span></h2>
 <p style="font-size:13px;">A single tradeable instrument priced as BTC-MINI's index minus ETH-MINI's index.
-<a href="__WEBSITE_URL__/spread" target="_blank">Open Spread Matrix page</a></p>
+<a href="__WEBSITE_URL__/inter-spread" target="_blank">Open Inter-Spread page</a></p>
 <button onclick="setSpreadEnabled(true)">Enable</button>
 <button onclick="setSpreadEnabled(false)">Disable</button>
 <button onclick="loadSpread()">Refresh</button>
@@ -705,6 +855,14 @@ function killOrders() {
   const id = requireVal('fz-id', 'an account ID');
   if (id) callApi('DELETE', '/accounts/' + id + '/orders');
 }
+function adjustBalance() {
+  const id = requireVal('adj-id', 'an account ID');
+  if (!id) return;
+  callApi('POST', '/accounts/' + id + '/adjust_balance', {
+    delta: parseFloat(val('adj-delta')),
+    reason: val('adj-reason'),
+  }).then(loadAccounts);
+}
 
 function pollMarket(product) {
   poll('/market/' + product, (d) => {
@@ -762,7 +920,8 @@ async function loadBots() {
   const res = await fetch('/bots');
   const rows = await res.json();
   document.getElementById('bots-table').innerHTML = rows.map(r =>
-    `<tr><td>${r.account_id}</td><td>${r.product}</td><td>${r.config.base_spread_frac}</td>` +
+    `<tr><td>${r.account_id}</td><td>${r.product}</td><td>${r.config.legs}</td>` +
+    `<td>${r.config.min_spread_ticks} / ${r.config.delta_ticks}</td>` +
     `<td>${r.config.quote_size}</td><td>${r.config.active}</td>` +
     `<td><button onclick="toggleMmBot('${r.account_id}', ${!r.config.active})">${r.config.active ? 'Turn off' : 'Turn on'}</button></td></tr>`
   ).join('');
@@ -775,7 +934,9 @@ function toggleMmBot(accountId, newActive) {
 function spawnMmBot() {
   callApi('POST', '/bots', {
     product: val('spawn-mm-product'),
-    base_spread_frac: parseFloat(val('spawn-mm-spread')),
+    legs: parseInt(val('spawn-mm-legs')),
+    min_spread_ticks: parseFloat(val('spawn-mm-minspread')),
+    delta_ticks: parseFloat(val('spawn-mm-delta')),
     quote_size: parseInt(val('spawn-mm-size')),
     skew_sensitivity: parseFloat(val('spawn-mm-skew')),
     requote_interval: parseFloat(val('spawn-mm-interval')),
@@ -816,6 +977,28 @@ function spawnNoiseBot() {
     arrival_rate_per_sec: parseFloat(val('spawn-noise-rate')),
     max_size: parseInt(val('spawn-noise-maxsize')),
   }).then(loadNoiseBots);
+}
+
+async function loadInsiderBots() {
+  const res = await fetch('/bots/insider');
+  const rows = await res.json();
+  const fmt = (v) => v === null || v === undefined ? 'n/a' : v.toFixed(2);
+  document.getElementById('insider-bots-table').innerHTML = rows.map(r =>
+    `<tr><td>${r.account_id}</td><td>${r.config.lead_seconds}</td><td>${r.config.size}</td>` +
+    `<td>$${fmt(r.cash)}</td><td>$${fmt(r.realized_pnl)}</td><td>${r.config.active}</td>` +
+    `<td><button onclick="toggleInsiderBot('${r.account_id}', ${!r.config.active})">${r.config.active ? 'Turn off' : 'Turn on'}</button></td>` +
+    `<td>${r.recent_fills.map(f => `${f.taker_side} ${f.qty} ${f.product} @ $${f.price.toFixed(2)}`).join('; ') || 'none yet'}</td></tr>`
+  ).join('') || '<tr><td colspan="8">no insider bots spawned</td></tr>';
+}
+function toggleInsiderBot(accountId, newActive) {
+  callApi('POST', '/bots/insider/' + accountId + '/params', { active: newActive }).then(loadInsiderBots);
+}
+function spawnInsiderBot() {
+  callApi('POST', '/bots/insider', {
+    lead_seconds: parseFloat(val('spawn-insider-lead')),
+    size: parseInt(val('spawn-insider-size')),
+    hold_after_seconds: parseFloat(val('spawn-insider-hold')),
+  }).then(loadInsiderBots);
 }
 
 function triggerShock() {
@@ -874,26 +1057,52 @@ function setSpreadScale() {
 
 function setBotParams() {
   const body = {};
-  if (val('bot-spread')) body.base_spread_frac = parseFloat(val('bot-spread'));
+  if (val('bot-legs')) body.legs = parseInt(val('bot-legs'));
+  if (val('bot-minspread')) body.min_spread_ticks = parseFloat(val('bot-minspread'));
+  if (val('bot-delta')) body.delta_ticks = parseFloat(val('bot-delta'));
   if (val('bot-size')) body.quote_size = parseInt(val('bot-size'));
   if (val('bot-active')) body.active = val('bot-active') === 'true';
   callApi('POST', '/bots/' + val('bot-id') + '/params', body).then(loadBots);
 }
 
+const OPTIONS_CHAIN_IDS = __OPTIONS_CHAIN_IDS_JSON__;
 async function loadOptions() {
   const res = await fetch('/instruments/options');
+  const data = await res.json();
+  document.getElementById('options-chains').innerHTML = OPTIONS_CHAIN_IDS.map(chainId => {
+    const d = data[chainId];
+    if (!d) return '';
+    const fmt = (v) => v === null || v === undefined ? 'n/a' : v.toFixed(2);
+    const rows = d.contracts.map(c =>
+      `<tr><td>${c.symbol}</td><td>${c.strike}</td><td>${c.option_type}</td>` +
+      `<td>${fmt(c.theo)}</td><td>${fmt(c.bid)}</td><td>${fmt(c.ask)}</td></tr>`
+    ).join('') || '<tr><td colspan="6">no active chain</td></tr>';
+    return `<h3>${chainId} (${d.underlying}) <span class="badge${d.enabled ? ' on' : ''}">${d.enabled ? 'ENABLED' : 'DISABLED'}</span></h3>` +
+      `<button onclick="setOptionsEnabled('${chainId}', true)">Enable</button>` +
+      `<button onclick="setOptionsEnabled('${chainId}', false)">Disable</button>` +
+      `<table><thead><tr><th>Symbol</th><th>Strike</th><th>Type</th><th>Theo</th><th>Bid</th><th>Ask</th></tr></thead><tbody>${rows}</tbody></table>`;
+  }).join('');
+}
+function setOptionsEnabled(chainId, enabled) {
+  callApi('POST', '/instruments/options/' + chainId + '/enabled', { enabled }).then(loadOptions);
+}
+
+async function loadFutures() {
+  const res = await fetch('/instruments/futures');
   const d = await res.json();
-  const badge = document.getElementById('options-badge');
+  const badge = document.getElementById('futures-badge');
   badge.textContent = d.enabled ? 'ENABLED' : 'DISABLED';
   badge.classList.toggle('on', d.enabled);
   const fmt = (v) => v === null || v === undefined ? 'n/a' : v.toFixed(2);
-  document.getElementById('options-table').innerHTML = d.contracts.map(c =>
-    `<tr><td>${c.symbol}</td><td>${c.strike}</td><td>${c.option_type}</td>` +
-    `<td>${fmt(c.theo)}</td><td>${fmt(c.bid)}</td><td>${fmt(c.ask)}</td></tr>`
-  ).join('') || '<tr><td colspan="6">no active chain</td></tr>';
+  document.getElementById('futures-underlyings').innerHTML = Object.entries(d.underlyings).map(([u, info]) => {
+    const futRows = info.futures.map(f => `<tr><td>${f.symbol}</td><td>${new Date(f.expiry_ts * 1000).toLocaleString()}</td><td>${fmt(f.last)}</td></tr>`).join('') || '<tr><td colspan="3">none live</td></tr>';
+    const calRows = info.calendar_spreads.map(c => `<tr><td>${c.symbol}</td><td>${c.near} - ${c.far}</td><td>${fmt(c.last)}</td></tr>`).join('') || '<tr><td colspan="3">none live</td></tr>';
+    return `<h3>${u}</h3><table><thead><tr><th>Contract</th><th>Expiry</th><th>Last</th></tr></thead><tbody>${futRows}</tbody></table>` +
+      `<table><thead><tr><th>Calendar spread</th><th>Legs</th><th>Last</th></tr></thead><tbody>${calRows}</tbody></table>`;
+  }).join('');
 }
-function setOptionsEnabled(enabled) {
-  callApi('POST', '/instruments/options/enabled', { enabled }).then(loadOptions);
+function setFuturesEnabled(enabled) {
+  callApi('POST', '/instruments/futures/enabled', { enabled }).then(loadFutures);
 }
 
 async function loadSpread() {
@@ -911,10 +1120,14 @@ loadAccounts();
 loadBots();
 loadNoiseBots();
 loadArbBots();
+loadInsiderBots();
 loadOptions();
+loadFutures();
 loadSpread();
 setInterval(loadOptions, 5000);
+setInterval(loadFutures, 5000);
 setInterval(loadSpread, 5000);
+setInterval(loadInsiderBots, 5000);
 </script>
 </body>
 </html>"""

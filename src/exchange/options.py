@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass
 
 from .bots import BotManager
-from .config import OptionsConfig, ProductConfig
+from .config import MMBotDefaults, OptionsChainConfig, ProductConfig
 from .engine import MatchingEngine, OrderRejected
 from .index_feed import IndexPriceService
 from .models import Side
@@ -70,12 +70,14 @@ class OptionsChainManager:
         engine: MatchingEngine,
         index_service: IndexPriceService,
         bot_manager: BotManager,
-        cfg: OptionsConfig,
+        cfg: OptionsChainConfig,
+        mm_cfg: MMBotDefaults,
     ):
         self.engine = engine
         self.index_service = index_service
         self.bot_manager = bot_manager
         self.cfg = cfg
+        self.mm_cfg = mm_cfg
         self.chain: dict[str, OptionInstrument] = {}
 
     # -- pricing ------------------------------------------------------------
@@ -90,14 +92,16 @@ class OptionsChainManager:
             self.index_service.on_raw_tick(opt.symbol, theo, now)
 
     # -- chain lifecycle ------------------------------------------------------
-    @staticmethod
-    def _symbol(expiry_ts: float, strike: float, option_type: str) -> str:
+    def _symbol(self, expiry_ts: float, strike: float, option_type: str) -> str:
         expiry_label = time.strftime("%H%M", time.gmtime(expiry_ts))
         suffix = "C" if option_type == "call" else "P"
+        # Prefix from the chain's own id (btc/eth/btc_eth_spread), not a
+        # hardcoded "BTC-" — this class is now generic across chains.
         # .0f would collide for a sub-1.0 strike_increment (e.g. 77.5 and
         # 78.0 both rendering "78") — always carrying 2 decimals keeps every
         # strike's symbol unique regardless of the configured increment.
-        return f"BTC-{expiry_label}-{strike:.2f}{suffix}"
+        prefix = self.cfg.id.upper().replace("_", "")
+        return f"{prefix}-{expiry_label}-{strike:.2f}{suffix}"
 
     def create_chain(self, now: float, expiry_ts: float) -> None:
         spot = self.index_service.get_index_price(self.cfg.underlying, now)
@@ -114,8 +118,8 @@ class OptionsChainManager:
                     symbol=symbol,
                     underlying=self.cfg.underlying,
                     contract_size=self.cfg.contract_size,
-                    max_position=self.cfg.max_position,
                     tick_size=self.cfg.tick_size,
+                    leverage=self.cfg.leverage,
                     starting_price=spot,
                 )
                 self.engine.add_product(product_cfg)
@@ -127,13 +131,14 @@ class OptionsChainManager:
                     expiry_ts=expiry_ts,
                     underlying=self.cfg.underlying,
                 )
-                # Options run small near strike (theo can be a few cents) —
-                # a base-spread fraction sized for a $75-notional future
-                # would collapse to sub-tick here; the bot's own bid<ask
-                # tick floor keeps quotes sane regardless, so an oversized
-                # fraction is a deliberate choice, not a bug.
                 self.bot_manager.spawn_mm_bot(
-                    symbol, base_spread_frac=0.15, quote_size=3, skew_sensitivity=0.05, requote_interval=1.5
+                    symbol,
+                    legs=self.mm_cfg.legs,
+                    min_spread_ticks=self.mm_cfg.min_spread_ticks,
+                    delta_ticks=self.mm_cfg.delta_ticks,
+                    quote_size=self.mm_cfg.quote_size,
+                    skew_sensitivity=self.mm_cfg.skew_sensitivity,
+                    requote_interval=self.mm_cfg.requote_interval,
                 )
 
     def _settle_and_retire(self, opt: OptionInstrument, now: float) -> None:
@@ -159,7 +164,7 @@ class OptionsChainManager:
                 except OrderRejected:
                     pass
 
-        self.bot_manager.mm_bots = [b for b in self.bot_manager.mm_bots if b.product != opt.symbol]
+        self.bot_manager.remove_mm_bot(opt.symbol)
         self.engine.remove_product(opt.symbol)
         self.index_service.remove_product(opt.symbol)
         self.chain.pop(opt.symbol, None)
@@ -181,9 +186,10 @@ class OptionsScheduler:
     chain. Same shape as synthetic_feed.RandomEventScheduler — a small,
     independent background task wired into app.py's asyncio.gather."""
 
-    def __init__(self, manager: OptionsChainManager, state):
+    def __init__(self, manager: OptionsChainManager, state, chain_id: str):
         self.manager = manager
-        self.state = state  # duck-typed: only .options_enabled is read
+        self.state = state  # duck-typed: only .options_enabled[chain_id] is read
+        self.chain_id = chain_id
         self._stop = False
 
     def stop(self) -> None:
@@ -200,4 +206,4 @@ class OptionsScheduler:
             if self._stop:
                 break
             now = time.time()
-            self.manager.roll(now, next_boundary(now, window), self.state.options_enabled)
+            self.manager.roll(now, next_boundary(now, window), self.state.options_enabled[self.chain_id])

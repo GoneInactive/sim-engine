@@ -1,4 +1,4 @@
-# Mini-Exchange Workshop — Build Spec
+# miniX Workshop — Build Spec
 
 ## 0. Context (for whoever picks this up)
 

@@ -49,6 +49,13 @@ def apply_fill(account: Account, product: str, side: Side, qty: int, price: floa
     return realized
 
 
+def apply_adjustment(account: Account, delta: float) -> float:
+    """Admin-driven direct balance change (deposit/withdrawal), independent
+    of any trade — see api_admin.py's /accounts/{id}/adjust_balance."""
+    account.cash += delta
+    return account.cash
+
+
 def unrealized_pnl(account: Account, index_prices: dict[str, float]) -> float:
     total = 0.0
     for product, pos in account.positions.items():
@@ -68,3 +75,18 @@ def equity(account: Account, index_prices: dict[str, float]) -> float:
 def would_breach_max_position(pos: Position, side: Side, qty: int, max_position: int) -> bool:
     prospective = pos.qty + side.sign * qty
     return abs(prospective) > max_position
+
+
+def max_position_for(cash: float, leverage: float, mark_price: float | None) -> int:
+    """Balance-relative position cap, replacing the old fixed-contract-count
+    MAX_POSITION: an account can hold up to `leverage` times its own cash in
+    notional (cash and mark_price both real dollars — mark_price is the
+    instrument's current contract-scaled index price, already the "price of
+    one contract", not the raw underlying price). Floors at 1 contract (a
+    student with a nonnegative balance can always place a starter order)
+    unless cash itself is negative, and at 0 when there's no price yet to
+    size against."""
+    if mark_price is None or mark_price == 0:
+        return 0
+    notional_capacity = max(cash, 0.0) * leverage
+    return max(1, int(notional_capacity / abs(mark_price)))

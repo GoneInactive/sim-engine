@@ -24,7 +24,7 @@ import asyncio
 import json
 import time
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -40,7 +40,7 @@ class RegisterIn(BaseModel):
 PAGE_TEMPLATE = """<!doctype html>
 <html>
 <head>
-<title>Mini-Exchange</title>
+<title>{exchange_name}</title>
 <style>
   * {{ box-sizing:border-box; }}
   body {{ background:#fff; color:#000; font-family: ui-monospace, monospace; margin:0; padding:24px; }}
@@ -835,14 +835,15 @@ def _ladder_block(product: str, tick: float) -> str:
 """
 
 
-def _options_payload(state: AppState) -> dict:
-    """Current option chain summary — shared by the 'options' WS channel
-    (see create_website_app's ws_feed) so there's one implementation, not
-    a REST copy and a WS copy that could drift apart."""
+def _options_payload(state: AppState, chain_id: str) -> dict:
+    """Current option chain summary — shared by the 'options:<chain_id>' WS
+    channel (see create_website_app's ws_feed) so there's one
+    implementation, not a REST copy and a WS copy that could drift apart."""
+    manager = state.options_managers[chain_id]
     now = time.time()
     contracts = []
     expiry_ts = None
-    for opt in state.options_manager.chain.values():
+    for opt in manager.chain.values():
         expiry_ts = opt.expiry_ts
         book = state.engine.book_snapshot(opt.symbol, depth=1)
         contracts.append({
@@ -853,22 +854,54 @@ def _options_payload(state: AppState) -> dict:
             "bid": book["bids"][0]["price"] if book["bids"] else None,
             "ask": book["asks"][0]["price"] if book["asks"] else None,
         })
-    underlying_price = state.index_service.get_index_price(state.config.options.underlying, now)
+    underlying_price = state.index_service.get_index_price(manager.cfg.underlying, now)
     return {"expiry_ts": expiry_ts, "contracts": contracts, "underlying_price": underlying_price}
 
 
+def _futures_payload(state: AppState) -> dict:
+    """Live futures contracts + calendar spreads per underlying — shared by
+    the 'futures_matrix' WS channel and the Inter-Spread page."""
+    now = time.time()
+    out: dict[str, dict] = {}
+    for underlying in state.config.futures.underlyings:
+        contracts = sorted(state.futures_manager.contracts[underlying].values(), key=lambda f: f.expiry_ts)
+        spreads = sorted(state.futures_manager.calendar_spreads[underlying].values(), key=lambda c: c.symbol)
+        out[underlying] = {
+            "futures": [
+                {"symbol": f.symbol, "expiry_ts": f.expiry_ts, "last": state.index_service.get_index_price(f.symbol, now)}
+                for f in contracts
+            ],
+            "calendar_spreads": [
+                {"symbol": c.symbol, "near": c.near_symbol, "far": c.far_symbol, "last": state.index_service.get_index_price(c.symbol, now)}
+                for c in spreads
+            ],
+        }
+    return out
+
+
+def _find_option(state: AppState, symbol: str):
+    for manager in state.options_managers.values():
+        opt = manager.chain.get(symbol)
+        if opt is not None:
+            return opt
+    return None
+
+
 def create_website_app(state: AppState) -> FastAPI:
-    app = FastAPI(title="Mini-Exchange Website")
+    app = FastAPI(title=f"{state.config.exchange_name} Website")
 
     nav = (
         '<nav><a href="/">Order Books</a><a href="/options">Options Chain</a>'
-        '<a href="/spread">Spread Matrix</a><a href="/leaderboard">Leaderboard</a>'
+        '<a href="/inter-spread">Inter-Spread</a><a href="/leaderboard">Leaderboard</a>'
         '<a href="/portfolio">Portfolio</a><a href="/chat">Chat</a>'
         f'<a href="{state.config.network.admin_api_base_url}/" target="_blank">Admin</a></nav>'
     )
 
     def page(body: str) -> str:
-        return PAGE_TEMPLATE.format(nav=nav, body=body, api_base_url=state.config.network.api_base_url)
+        return PAGE_TEMPLATE.format(
+            nav=nav, body=body, api_base_url=state.config.network.api_base_url,
+            exchange_name=state.config.exchange_name,
+        )
 
     @app.get("/", response_class=HTMLResponse)
     def order_books():
@@ -877,8 +910,8 @@ def create_website_app(state: AppState) -> FastAPI:
             cols += _ladder_block(product, cfg.tick_size)
         return page(f'<div class="cols">{cols}</div>')
 
-    @app.get("/spread", response_class=HTMLResponse)
-    def spread_matrix():
+    @app.get("/inter-spread", response_class=HTMLResponse)
+    def inter_spread_matrix():
         symbol = state.config.spread.symbol
         if not state.spread_enabled:
             banner = (
@@ -888,16 +921,94 @@ def create_website_app(state: AppState) -> FastAPI:
         else:
             banner = ""
         tick = state.config.spread.tick_size
-        return page(f"<h2>Spread Matrix</h2>{banner}" + f'<div class="cols">{_ladder_block(symbol, tick)}</div>')
+        underlyings_json = json.dumps(list(state.config.futures.underlyings))
+        body = f"""
+<h2>Inter-Spread</h2>
+<h3>BTC / ETH cross-product spread</h3>
+{banner}
+<div class="cols">{_ladder_block(symbol, tick)}</div>
+
+<h3>Futures &amp; calendar spreads</h3>
+<p class="meta">Click any contract or calendar spread cell to open its ladder.
+{"" if state.futures_enabled else "Currently disabled by the admin."}</p>
+<div id="futures-matrix"></div>
+
+<div id="im-sidebar" class="chain-sidebar">
+  <div class="chain-sidebar-head">
+    <strong id="im-sidebar-title"></strong>
+    <button onclick="closeImLadder()">&times; Close</button>
+  </div>
+  <iframe id="im-sidebar-frame" src="about:blank"></iframe>
+</div>
+
+<script>
+function openImLadder(symbol) {{
+  document.getElementById('im-sidebar-title').textContent = symbol;
+  document.getElementById('im-sidebar-frame').src = '/ladder/' + encodeURIComponent(symbol) + '?embed=1';
+  document.getElementById('im-sidebar').classList.add('open');
+}}
+function closeImLadder() {{
+  document.getElementById('im-sidebar').classList.remove('open');
+  document.getElementById('im-sidebar-frame').src = 'about:blank';
+}}
+function renderFuturesMatrix(data) {{
+  const underlyings = {underlyings_json};
+  const fmt = (v) => v === null || v === undefined ? '—' : v.toFixed(2);
+  document.getElementById('futures-matrix').innerHTML = underlyings.map(u => {{
+    const info = data[u] || {{futures: [], calendar_spreads: []}};
+    const futCells = info.futures.map(f =>
+      `<td class="call-cell" onclick="openImLadder('${{f.symbol}}')">${{f.symbol}}<br>${{fmt(f.last)}}</td>`
+    ).join('') || '<td>none live</td>';
+    const calCells = info.calendar_spreads.map(c =>
+      `<td class="put-cell" onclick="openImLadder('${{c.symbol}}')">${{c.near}} / ${{c.far}}<br>${{fmt(c.last)}}</td>`
+    ).join('') || '<td>none live</td>';
+    return `<div class="chain-underlying" style="font-size:15px;">${{u}}</div>` +
+      `<table class="chain-table"><tbody>` +
+      `<tr><th style="text-align:left;">Futures</th>${{futCells}}</tr>` +
+      `<tr><th style="text-align:left;">Calendar spreads</th>${{calCells}}</tr>` +
+      `</tbody></table>`;
+  }}).join('');
+}}
+window.__wsChannels = ['futures_matrix'];
+onChannel('futures_matrix', renderFuturesMatrix);
+</script>
+"""
+        return page(body)
+
+    @app.get("/ladder/{symbol}", response_class=HTMLResponse)
+    def generic_ladder(symbol: str, embed: bool = False):
+        product_cfg = state.engine.products.get(symbol)
+        if product_cfg is None:
+            body = (
+                f'<h2>{symbol}</h2>'
+                '<p class="meta">This contract is no longer active (expired/settled, or the chain has rolled). '
+                '<a href="/inter-spread">Back to Inter-Spread</a></p>'
+            )
+            return page(body)
+        header = f'<h2>{symbol}</h2>' + ("" if embed else ' <a href="/inter-spread">Back to Inter-Spread</a>')
+        content = header + f'<div class="cols">{_ladder_block(symbol, product_cfg.tick_size)}</div>'
+        if embed:
+            content = "<style>.topbar nav{display:none} body{padding:10px}</style>" + content
+        return page(content)
 
     @app.get("/options", response_class=HTMLResponse)
-    def options_chain():
-        contracts = sorted(state.options_manager.chain.values(), key=lambda o: (o.strike, o.option_type))
+    def options_chain(chain: str = "btc"):
+        if chain not in state.options_managers:
+            chain = next(iter(state.options_managers), None)
+        tabs = "".join(
+            f'<a href="/options?chain={cid}" style="margin-right:16px;{"font-weight:700;text-decoration:underline;" if cid == chain else ""}">{cid}</a>'
+            for cid in state.options_managers
+        )
+        tabs_html = f'<div class="meta">{tabs}</div>' if len(state.options_managers) > 1 else ""
+        if chain is None:
+            return page("<h2>Options Chain</h2>" + tabs_html + '<p class="meta">No option chains configured.</p>')
+        manager = state.options_managers[chain]
+        contracts = sorted(manager.chain.values(), key=lambda o: (o.strike, o.option_type))
         if not contracts:
             body = (
-                "<h2>Options Chain</h2>"
+                "<h2>Options Chain</h2>" + tabs_html +
                 '<p class="meta">No active chain right now'
-                + ("." if state.options_enabled else " — 15-min BTC options are currently disabled by the admin.")
+                + ("." if state.options_enabled[chain] else " — this chain is currently disabled by the admin.")
                 + "</p>"
             )
             return page(body)
@@ -916,7 +1027,8 @@ def create_website_app(state: AppState) -> FastAPI:
         )
         body = f"""
 <h2>Options Chain</h2>
-<div class="chain-underlying">{state.config.options.underlying} <span id="chain-underlying-price">...</span></div>
+{tabs_html}
+<div class="chain-underlying">{manager.cfg.underlying} <span id="chain-underlying-price">...</span></div>
 <p class="meta">expiry <span id="opt-expiry"></span> &middot; click any Bid/Theo/Ask cell to open that contract's ladder</p>
 <div style="overflow-x:auto;">
 <table class="chain-table">
@@ -979,8 +1091,8 @@ async function renderChainPositions() {{
     ? rows.map(([sym, pos]) => `<tr><td>${{sym}}</td><td>${{pos.qty}}</td><td>$${{pos.avg_cost.toFixed(2)}}</td></tr>`).join('')
     : '<tr><td colspan="3">no open option positions</td></tr>';
 }}
-window.__wsChannels = ['options'];
-onChannel('options', (d) => {{
+window.__wsChannels = ['options:{chain}'];
+onChannel('options:{chain}', (d) => {{
   document.getElementById('opt-expiry').textContent = d.expiry_ts
     ? new Date(d.expiry_ts * 1000).toLocaleTimeString() : 'n/a';
   const priceEl = document.getElementById('chain-underlying-price');
@@ -1000,7 +1112,7 @@ window.onLogin = renderChainPositions;
 
     @app.get("/options/{symbol}", response_class=HTMLResponse)
     def option_ladder(symbol: str, embed: bool = False):
-        opt = state.options_manager.chain.get(symbol)
+        opt = _find_option(state, symbol)
         if opt is None:
             body = (
                 f'<h2>{symbol}</h2>'
@@ -1015,7 +1127,7 @@ window.onLogin = renderChainPositions;
             + ("" if embed else ' &middot; <a href="/options">Back to Options Chain</a>')
             + "</p>"
         )
-        tick = state.config.options.tick_size
+        tick = state.engine.products[symbol].tick_size
         content = header + f'<div class="cols">{_ladder_block(symbol, tick)}</div>'
         if embed:
             # Opened inside the chain page's slide-in sidebar — the full nav
@@ -1198,12 +1310,14 @@ async function sendChat() {
         return page(body)
 
     @app.post("/data/register")
-    def data_register(body: RegisterIn):
+    def data_register(body: RegisterIn, request: Request):
+        client_ip = request.client.host if request.client else None
         try:
-            key = state.register_student(body.account_id, body.password)
+            key = state.register_student(body.account_id, body.password, client_ip)
         except AccountExistsError:
             raise HTTPException(status_code=409, detail="account already registered, use login")
-        return {"account_id": body.account_id, "api_key": key, "active": True}
+        record = state.auth.key_for_account(body.account_id)
+        return {"account_id": body.account_id, "api_key": key, "active": record.active if record else True}
 
     def _channel_data(channel: str, key: str | None) -> object:
         """Dispatch for the /ws feed below — one function per channel
@@ -1216,8 +1330,13 @@ async function sendChat() {
             return state.leaderboard()
         if channel == "chat":
             return list(state.chat_messages)
-        if channel == "options":
-            return _options_payload(state)
+        if channel.startswith("options:"):
+            chain_id = channel[len("options:"):]
+            if chain_id not in state.options_managers:
+                return None
+            return _options_payload(state, chain_id)
+        if channel == "futures_matrix":
+            return _futures_payload(state)
         if channel.startswith("book:"):
             product = channel[len("book:"):]
             if product not in state.engine.products:

@@ -20,8 +20,10 @@ from .auth import AccountExistsError, AuthStore
 from .bots import BotManager
 from .config import Config, ProductConfig
 from .engine import MatchingEngine
+from .futures import FuturesChainManager
 from .index_feed import IndexPriceService
-from .ledger import equity, unrealized_pnl
+from .ledger import apply_adjustment, equity, unrealized_pnl
+from .models import next_adjustment_id
 from .options import OptionsChainManager, next_boundary
 
 if TYPE_CHECKING:
@@ -35,19 +37,30 @@ CHAT_MAX_LEN = 300
 
 
 def _is_bot_account(account_id: str) -> bool:
-    return account_id.startswith("mm_") or account_id.startswith("noise_") or account_id.startswith("arb_")
+    return (
+        account_id.startswith("mm_")
+        or account_id.startswith("noise_")
+        or account_id.startswith("arb_")
+        or account_id.startswith("insider_")
+    )
 
 
 class AppState:
     def __init__(self, config: Config, persistence_log: "PersistenceLog | None" = None):
         self.config = config
         self.persistence_log = persistence_log
+        # index_service is built before the engine so the engine can be
+        # wired with a live mark_price_fn (relative MAX_POSITION sizing,
+        # see ledger.max_position_for) at construction time.
+        self.index_service = IndexPriceService(config.feed, config.products)
         self.engine = MatchingEngine(
             config.products, config.fees.maker_bps, config.fees.taker_bps,
             on_fill=self._on_fill, on_order=self._on_order,
+            mark_price_fn=self.index_service.get_index_price,
         )
-        self.index_service = IndexPriceService(config.feed, config.products)
-        self.bot_manager = BotManager(self.engine, self.index_service, config.accounts.starting_cash)
+        self.bot_manager = BotManager(
+            self.engine, self.index_service, config.accounts.starting_cash, mm_defaults=config.mm_bots.default,
+        )
         self.bot_manager.spawn_defaults(list(config.products.keys()))
         self.auth = AuthStore(config.admin_password, config.website_password)
         self.feed_mode: dict[str, str] = {symbol: "live" for symbol in config.products}
@@ -82,8 +95,8 @@ class AppState:
             symbol=config.spread.symbol,
             underlying=f"{config.spread.btc_product}-{config.spread.eth_product}",
             contract_size=config.spread.contract_size,
-            max_position=config.spread.max_position,
             tick_size=config.spread.tick_size,
+            leverage=config.spread.leverage,
             allow_negative_price=True,
         )
         self.engine.add_product(spread_cfg)
@@ -94,12 +107,36 @@ class AppState:
             self._set_bots_active(config.spread.symbol, False)
         self.price_history[config.spread.symbol] = deque(maxlen=PRICE_HISTORY_LEN)
 
-        # -- 15-minute BTC options chain ---------------------------------
-        self.options_manager = OptionsChainManager(self.engine, self.index_service, self.bot_manager, config.options)
-        self.options_enabled = config.options.enabled_default
-        if self.options_enabled:
+        # -- rolling option chains ---------------------------------------
+        self.options_managers: dict[str, OptionsChainManager] = {}
+        self.options_enabled: dict[str, bool] = {}
+        for chain_id, occfg in config.options.items():
+            manager = OptionsChainManager(self.engine, self.index_service, self.bot_manager, occfg, config.mm_bots.options)
+            self.options_managers[chain_id] = manager
+            enabled = occfg.enabled_default
+            self.options_enabled[chain_id] = enabled
+            if enabled:
+                now = time.time()
+                manager.create_chain(now, next_boundary(now, occfg.window_seconds))
+
+        # -- 1-hour rolling futures + calendar spreads --------------------
+        self.futures_manager = FuturesChainManager(
+            self.engine, self.index_service, self.bot_manager, config.futures, config.mm_bots.futures,
+        )
+        self.futures_enabled = config.futures.enabled_default
+        if self.futures_enabled:
             now = time.time()
-            self.options_manager.create_chain(now, next_boundary(now, config.options.window_seconds))
+            for underlying in config.futures.underlyings:
+                self.futures_manager.init_chain(underlying, now)
+
+        # -- insider bots ---------------------------------------------------
+        if config.insider_bots.enabled_default:
+            for _ in range(config.insider_bots.count):
+                self.bot_manager.spawn_insider_bot(
+                    lead_seconds=config.insider_bots.lead_seconds,
+                    size=config.insider_bots.size,
+                    hold_after_seconds=config.insider_bots.hold_after_seconds,
+                )
 
         # -- global chat ---------------------------------------------------
         # One shared room, everyone with an account can post — durable via
@@ -162,18 +199,40 @@ class AppState:
         self._set_bots_active(self.config.spread.symbol, enabled)
         return self.spread_enabled
 
-    def set_options_enabled(self, enabled: bool) -> bool:
-        self.options_enabled = enabled
-        if enabled and not self.options_manager.chain:
+    def set_options_enabled(self, chain_id: str, enabled: bool) -> bool:
+        manager = self.options_managers[chain_id]
+        self.options_enabled[chain_id] = enabled
+        if enabled and not manager.chain:
             now = time.time()
-            self.options_manager.create_chain(now, next_boundary(now, self.config.options.window_seconds))
-        return self.options_enabled
+            manager.create_chain(now, next_boundary(now, manager.cfg.window_seconds))
+        return self.options_enabled[chain_id]
+
+    def set_futures_enabled(self, enabled: bool) -> bool:
+        self.futures_enabled = enabled
+        if enabled:
+            now = time.time()
+            for underlying in self.config.futures.underlyings:
+                if not self.futures_manager.contracts[underlying]:
+                    self.futures_manager.init_chain(underlying, now)
+        return self.futures_enabled
+
+    def adjust_balance(self, account_id: str, delta: float, reason: str) -> float:
+        account = self.engine.accounts.get(account_id)
+        if account is None:
+            raise KeyError(account_id)
+        new_cash = apply_adjustment(account, delta)
+        if self.persistence_log is not None:
+            self.persistence_log.log_adjustment(next_adjustment_id(), account_id, delta, reason, time.time())
+        return new_cash
 
     def is_tradeable(self, symbol: str) -> bool:
         if symbol == self.config.spread.symbol:
             return self.spread_enabled
-        if symbol in self.options_manager.chain:
-            return self.options_enabled
+        for chain_id, manager in self.options_managers.items():
+            if symbol in manager.chain:
+                return self.options_enabled[chain_id]
+        if symbol in self.futures_manager.all_symbols():
+            return self.futures_enabled
         return True
 
     def _book_mid(self, product: str) -> tuple[float | None, float | None, float | None]:
@@ -255,12 +314,16 @@ class AppState:
             account_id, record.key, record.active, record.password_salt, record.password_hash,
         )
 
-    def register_student(self, account_id: str, password: str) -> str:
+    def register_student(self, account_id: str, password: str, client_ip: str | None = None) -> str:
         """Self-serve registration: active immediately, no admin approval
-        step. Deposits the starting cash on account creation."""
+        step — unless `client_ip` has already self-registered
+        AuthStore.MAX_SELF_SERVE_ACCOUNTS_PER_IP accounts, in which case
+        this one is created inactive and needs an admin to activate it (see
+        AuthStore.register). Deposits the starting cash on account
+        creation either way."""
         self.engine.get_or_create_account(account_id, self.config.accounts.starting_cash)
         self.starting_cash_by_account.setdefault(account_id, self.config.accounts.starting_cash)
-        record = self.auth.register(account_id, password)
+        record = self.auth.register(account_id, password, client_ip)
         self._log_account_and_credentials(account_id, self.config.accounts.starting_cash, record)
         return record.key
 

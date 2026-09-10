@@ -2,8 +2,8 @@ from exchange.config import FeedConfig, ProductConfig
 from exchange.index_feed import IndexPriceService
 
 PRODUCTS = {
-    "BTC-MINI": ProductConfig(symbol="BTC-MINI", underlying="BTC/USD", contract_size=0.001, max_position=15, tick_size=0.05),
-    "ETH-MINI": ProductConfig(symbol="ETH-MINI", underlying="ETH/USD", contract_size=0.03, max_position=15, tick_size=0.05),
+    "BTC-MINI": ProductConfig(symbol="BTC-MINI", underlying="BTC/USD", contract_size=0.001, tick_size=0.05),
+    "ETH-MINI": ProductConfig(symbol="ETH-MINI", underlying="ETH/USD", contract_size=0.03, tick_size=0.05),
 }
 FEED = FeedConfig(stale_threshold_seconds=5.0, sma_window=3, reconnect_blend_seconds=4.0, shock_decay_seconds=2.0)
 

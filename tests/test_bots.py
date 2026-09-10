@@ -5,7 +5,7 @@ from exchange.index_feed import IndexPriceService
 from exchange.models import OrderType, Side
 
 PRODUCTS = {
-    "BTC-MINI": ProductConfig(symbol="BTC-MINI", underlying="BTC/USD", contract_size=0.001, max_position=15, tick_size=0.05),
+    "BTC-MINI": ProductConfig(symbol="BTC-MINI", underlying="BTC/USD", contract_size=0.001, tick_size=0.05),
 }
 FEED = FeedConfig(stale_threshold_seconds=7, sma_window=20, reconnect_blend_seconds=7, shock_decay_seconds=7)
 
@@ -19,23 +19,20 @@ def make_manager():
     return manager, engine, index_service
 
 
-def test_mm_bots_quote_around_index():
+def test_mm_bot_quotes_around_index():
     manager, engine, index_service = make_manager()
     for bot in manager.mm_bots:
         bot.maybe_requote(engine, index_service, manager.liquidity_events, now=10.0)
     book = engine.book_snapshot("BTC-MINI", depth=20)
-    # 5 bots each post a bid+ask, but with tick-aligned prices (see
-    # test_mm_quotes_snap_to_tick_grid) two bots can legitimately land on
-    # the same level and aggregate into one row — so assert total quoted
-    # size rather than a fixed level count.
+    bot = manager.mm_bots[0]
     assert len(book["bids"]) >= 1
     assert len(book["asks"]) >= 1
-    assert sum(b["qty"] for b in book["bids"]) == sum(3 + i for i in range(5))
-    assert sum(a["qty"] for a in book["asks"]) == sum(3 + i for i in range(5))
+    assert sum(b["qty"] for b in book["bids"]) == bot.config.quote_size * bot.config.legs
+    assert sum(a["qty"] for a in book["asks"]) == bot.config.quote_size * bot.config.legs
     best_bid = book["bids"][0]["price"]
     best_ask = book["asks"][0]["price"]
     assert best_bid < 80.0 < best_ask
-    assert best_ask - best_bid < 2.0  # tightest bot's spread should be small
+    assert best_ask - best_bid < 2.0  # tightest leg's spread should be small
 
 
 def test_noise_bots_eventually_trade():
@@ -158,10 +155,10 @@ def test_arb_bot_inactive_does_not_correct():
 
 def test_spawn_mm_bot_adds_and_indexes_account():
     manager, engine, index_service = make_manager()
-    assert len(manager.mm_bots) == 5
-    bot = manager.spawn_mm_bot("BTC-MINI", base_spread_frac=0.01, quote_size=2)
-    assert len(manager.mm_bots) == 6
-    assert bot.config.account_id == "mm_BTC-MINI_5"
+    assert len(manager.mm_bots) == 1
+    bot = manager.spawn_mm_bot("BTC-MINI", legs=2, min_spread_ticks=1.0, delta_ticks=1.0, quote_size=2)
+    assert len(manager.mm_bots) == 2
+    assert bot.config.account_id == "mm_BTC-MINI_1"
     assert bot.config.account_id in engine.accounts
 
 
@@ -194,10 +191,21 @@ def test_mm_inventory_skew_shifts_quotes():
         bot.maybe_requote(engine, index_service, manager.liquidity_events, now=10.0)
     bot = manager.mm_bots[0]
     # force a long position on the bot to check skew direction
-    from exchange.models import Side
     engine.accounts[bot.config.account_id].position_for("BTC-MINI").qty = 10
     bot.last_quote_time = 0.0
     bot.maybe_requote(engine, index_service, manager.liquidity_events, now=20.0)
-    book = engine.book_snapshot("BTC-MINI", depth=20)
     # long inventory should skew this bot's mid below index (80)
-    assert bot.bid_order_id is not None
+    assert len(bot.bid_order_ids) > 0
+
+
+def test_mm_bot_legs_step_out_by_delta_ticks():
+    manager, engine, index_service = make_manager()
+    bot = manager.spawn_mm_bot("BTC-MINI", legs=4, min_spread_ticks=2.0, delta_ticks=1.0, quote_size=1)
+    bot.maybe_requote(engine, index_service, manager.liquidity_events, now=10.0)
+    assert len(bot.bid_order_ids) == 4
+    assert len(bot.ask_order_ids) == 4
+    bid_prices = sorted((engine.orders[oid].price for oid in bot.bid_order_ids), reverse=True)
+    # leg i sits min_spread_ticks + i*delta_ticks ticks wide (2,3,4,5) —
+    # each successive leg should be strictly farther from the touch.
+    gaps = [round((bid_prices[i] - bid_prices[i + 1]) / 0.05) for i in range(3)]
+    assert gaps == [1, 1, 1]

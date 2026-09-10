@@ -30,8 +30,17 @@ import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-from .ledger import apply_fill
-from .models import Fill, Order, OrderStatus, OrderType, Side, advance_fill_id_counter, advance_order_id_counter
+from .ledger import apply_adjustment, apply_fill
+from .models import (
+    Fill,
+    Order,
+    OrderStatus,
+    OrderType,
+    Side,
+    advance_adjustment_id_counter,
+    advance_fill_id_counter,
+    advance_order_id_counter,
+)
 
 logger = logging.getLogger("exchange.persistence")
 
@@ -90,6 +99,15 @@ fills_table = sa.Table(
     sa.Column("taker_fee_bps", sa.Float, nullable=True),
 )
 
+adjustments_table = sa.Table(
+    "adjustments", metadata,
+    sa.Column("id", sa.BigInteger, primary_key=True),
+    sa.Column("account_id", sa.Text, nullable=False),
+    sa.Column("delta", sa.Float, nullable=False),
+    sa.Column("reason", sa.Text, nullable=False),
+    sa.Column("timestamp", sa.Float, nullable=False),
+)
+
 chat_table = sa.Table(
     "chat_messages", metadata,
     sa.Column("id", sa.BigInteger, primary_key=True),
@@ -145,6 +163,12 @@ class PersistenceLog:
 
     def log_chat(self, message: dict) -> None:
         self._queue.put_nowait({"kind": "chat", "message": message})
+
+    def log_adjustment(self, adjustment_id: int, account_id: str, delta: float, reason: str, timestamp: float) -> None:
+        self._queue.put_nowait({
+            "kind": "adjustment", "id": adjustment_id, "account_id": account_id,
+            "delta": delta, "reason": reason, "timestamp": timestamp,
+        })
 
     # -- consumer ------------------------------------------------------------
     def stop(self) -> None:
@@ -223,6 +247,12 @@ class PersistenceLog:
                         id=m["id"], account_id=m["account_id"], text=m["text"], timestamp=m["timestamp"],
                     ).on_conflict_do_nothing(index_elements=["id"])
                     await conn.execute(stmt)
+                elif kind == "adjustment":
+                    stmt = pg_insert(adjustments_table).values(
+                        id=event["id"], account_id=event["account_id"], delta=event["delta"],
+                        reason=event["reason"], timestamp=event["timestamp"],
+                    ).on_conflict_do_nothing(index_elements=["id"])
+                    await conn.execute(stmt)
 
 
 async def replay_into(state, engine: AsyncEngine) -> None:
@@ -237,6 +267,9 @@ async def replay_into(state, engine: AsyncEngine) -> None:
         order_rows = (await conn.execute(sa.select(orders_table).order_by(orders_table.c.id))).mappings().all()
         fill_rows = (await conn.execute(sa.select(fills_table).order_by(fills_table.c.id))).mappings().all()
         chat_rows = (await conn.execute(sa.select(chat_table).order_by(chat_table.c.id))).mappings().all()
+        adjustment_rows = (
+            (await conn.execute(sa.select(adjustments_table).order_by(adjustments_table.c.id))).mappings().all()
+        )
 
     if not (cred_rows or account_rows or fill_rows):
         logger.info("persistence: nothing to restore (empty database)")
@@ -307,6 +340,11 @@ async def replay_into(state, engine: AsyncEngine) -> None:
         state.engine.orders[order.id] = order
         state.engine.orders_by_account.setdefault(order.account_id, {})[order.id] = order
 
+    for row in adjustment_rows:
+        account = state.engine.accounts.get(row["account_id"])
+        if account is not None:
+            apply_adjustment(account, row["delta"])
+
     for row in chat_rows:
         state.chat_messages.append({
             "id": row["id"], "account_id": row["account_id"], "text": row["text"], "timestamp": row["timestamp"],
@@ -316,10 +354,12 @@ async def replay_into(state, engine: AsyncEngine) -> None:
     max_fill_id = max((r["id"] for r in fill_rows), default=0)
     advance_order_id_counter(max_order_id)
     advance_fill_id_counter(max_fill_id)
+    max_adjustment_id = max((r["id"] for r in adjustment_rows), default=0)
+    advance_adjustment_id_counter(max_adjustment_id)
     max_chat_id = max((r["id"] for r in chat_rows), default=0)
     state._next_chat_id = itertools.count(max_chat_id + 1)
 
     logger.info(
-        "persistence: restored %d account(s), %d order(s), %d fill(s), %d chat message(s)",
-        len(account_rows), len(order_rows), len(fill_rows), len(chat_rows),
+        "persistence: restored %d account(s), %d order(s), %d fill(s), %d adjustment(s), %d chat message(s)",
+        len(account_rows), len(order_rows), len(fill_rows), len(adjustment_rows), len(chat_rows),
     )

@@ -94,9 +94,17 @@ class SyntheticFeedClient:
 class RandomEventScheduler:
     """Fires random admin-style events on its own timer, independent of
     the admin panel. Same underlying mechanisms as api_admin.py's
-    /events/* and /bots/noise routes, just self-triggered."""
+    /events/* and /bots/noise routes, just self-triggered.
+
+    The kind/product/direction of the *next* event is committed up front
+    (in _schedule_next, before the wait even starts) rather than decided at
+    fire time — magnitude is still randomized when it actually fires, but
+    the commitment lets peek_next_event() expose real advance knowledge for
+    bots.InsiderBot to "front-run", which is the whole point of that
+    teaching exercise."""
 
     _KINDS = ("shock", "drift", "liquidity", "spread")
+    _DIRECTIONAL_KINDS = ("shock", "drift")
 
     def __init__(self, index_service: IndexPriceService, bot_manager: BotManager, config: Config):
         self.index_service = index_service
@@ -104,9 +112,25 @@ class RandomEventScheduler:
         self.config = config
         self._counter = itertools.count(1)
         self._stop = False
+        self.next_event_at: float | None = None
+        self.next_event_kind: str | None = None
+        self.next_event_product: str | None = None
+        self.next_event_direction: int | None = None
 
     def stop(self) -> None:
         self._stop = True
+
+    def peek_next_event(self) -> dict | None:
+        """Read-only lookahead at the next scheduled event, for
+        bots.InsiderBot — never used to change when/what actually fires."""
+        if self.next_event_at is None:
+            return None
+        return {
+            "at": self.next_event_at,
+            "kind": self.next_event_kind,
+            "product": self.next_event_product,
+            "direction": self.next_event_direction,
+        }
 
     async def run(self) -> None:
         cfg = self.config.synthetic_feed
@@ -115,26 +139,36 @@ class RandomEventScheduler:
             return
         logger.info("random_events: enabled, mean_interval=%.0fs", cfg.random_event_mean_interval_seconds)
         while not self._stop:
-            wait = random.expovariate(1.0 / cfg.random_event_mean_interval_seconds)
+            self._schedule_next()
+            wait = max(0.0, self.next_event_at - time.time())
             await asyncio.sleep(wait)
             if not self._stop:
-                self._fire_one()
+                self._fire_scheduled()
 
-    def _fire_one(self) -> None:
+    def _schedule_next(self) -> None:
+        cfg = self.config.synthetic_feed
+        wait = random.expovariate(1.0 / cfg.random_event_mean_interval_seconds)
+        self.next_event_at = time.time() + wait
+        self.next_event_kind = random.choice(self._KINDS)
+        self.next_event_product = random.choice(list(self.config.products.keys()))
+        self.next_event_direction = random.choice([1, -1])
+
+    def _fire_scheduled(self) -> None:
         now = time.time()
         idx = next(self._counter)
-        kind = random.choice(self._KINDS)
-        product = random.choice(list(self.config.products.keys()))
+        kind = self.next_event_kind
+        product = self.next_event_product
+        direction = self.next_event_direction
         name = f"auto_{kind}_{idx}"
         tick = self.config.products[product].tick_size
 
         if kind == "shock":
-            target_offset = random.uniform(-40, 40) * tick  # up to ~40 ticks either way
+            target_offset = direction * random.uniform(5, 40) * tick
             self.index_service.trigger_price_shock(
                 product, target_offset, now, ramp_seconds=1.0, hold_seconds=random.uniform(5, 15), name=name
             )
         elif kind == "drift":
-            drift = random.uniform(-60, 60) * tick
+            drift = direction * random.uniform(10, 60) * tick
             duration = random.uniform(20, 60)
             self.index_service.trigger_bull_bear(product, drift, duration, now, name=name)
         elif kind == "liquidity":
@@ -148,3 +182,11 @@ class RandomEventScheduler:
             self.index_service.trigger_spread_event(spread_kind, magnitude, now, name=name)
 
         logger.info("random_events: fired %s (%s) on %s", name, kind, product)
+        # Cleared (not left stale pointing at what just fired) so a bot
+        # that hasn't ticked yet this instant sees "nothing scheduled" for
+        # the brief window until _schedule_next runs again, rather than a
+        # peek_next_event() that looks like a still-upcoming event.
+        self.next_event_at = None
+        self.next_event_kind = None
+        self.next_event_product = None
+        self.next_event_direction = None

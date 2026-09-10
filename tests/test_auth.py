@@ -76,3 +76,43 @@ def test_register_claims_admin_issued_account():
     assert claimed.key == admin_record.key  # same underlying account/key
     assert claimed.active is True
     assert store.login("student1", "pw").key == admin_record.key
+
+
+def test_register_over_ip_limit_requires_admin_approval():
+    store = make_store()
+    ip = "1.2.3.4"
+    for i in range(store.MAX_SELF_SERVE_ACCOUNTS_PER_IP):
+        record = store.register(f"student{i}", "pw", client_ip=ip)
+        assert record.active is True
+
+    fourth = store.register("student3", "pw", client_ip=ip)
+    assert fourth.active is False
+    assert store.resolve(fourth.key) is None  # inactive: doesn't resolve yet
+    # a password was still set, so once an admin activates it the student
+    # can log straight in without registering again
+    approved = store.activate(fourth.key)
+    assert approved.active is True
+    assert store.login("student3", "pw").key == fourth.key
+
+
+def test_register_ip_limit_is_per_ip_not_global():
+    store = make_store()
+    for i in range(store.MAX_SELF_SERVE_ACCOUNTS_PER_IP):
+        store.register(f"student{i}", "pw", client_ip="1.1.1.1")
+
+    other_ip_record = store.register("someone_else", "pw", client_ip="2.2.2.2")
+    assert other_ip_record.active is True
+
+
+def test_register_ip_limit_does_not_count_reclaiming_an_admin_issued_account():
+    store = make_store()
+    ip = "1.2.3.4"
+    for i in range(store.MAX_SELF_SERVE_ACCOUNTS_PER_IP):
+        store.register(f"student{i}", "pw", client_ip=ip)
+
+    # An admin pre-issued this account (e.g. ahead of a workshop) — a
+    # student claiming it via /register from an already-throttled IP is
+    # not a *new* self-serve account, so it shouldn't be penalized.
+    store.issue_key("preissued")
+    claimed = store.register("preissued", "pw", client_ip=ip)
+    assert claimed.active is True

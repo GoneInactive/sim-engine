@@ -1,4 +1,4 @@
-# Mini-Exchange API Reference
+# miniX API Reference
 
 Three separate HTTP services, all part of the same process (`python run.py`
 starts all three together):

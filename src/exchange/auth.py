@@ -47,11 +47,21 @@ class AccountExistsError(Exception):
 
 
 class AuthStore:
+    # Self-serve /register is rate-limited per source IP, not per account —
+    # past this many *new* accounts from one IP, further self-serve
+    # registrations from it are created inactive (same as the admin-issued
+    # path) instead of auto-active, so an admin has to explicitly approve
+    # them. In-memory only (not persisted): a restart resets every IP's
+    # count, which is an acceptable gap for a teaching-session tool, not
+    # something a determined abuser needs to survive a restart to exploit.
+    MAX_SELF_SERVE_ACCOUNTS_PER_IP = 3
+
     def __init__(self, admin_password: str, website_password: str):
         self.admin_password = admin_password
         self.website_password = website_password
         self.by_account: dict[str, ApiKeyRecord] = {}
         self.by_key: dict[str, ApiKeyRecord] = {}
+        self.registrations_by_ip: dict[str, list[str]] = {}
 
     def _new_record(self, account_id: str, active: bool) -> ApiKeyRecord:
         record = ApiKeyRecord(key=secrets.token_urlsafe(24), account_id=account_id, active=active)
@@ -85,15 +95,28 @@ class AuthStore:
             return existing
         return self._new_record(account_id, active=False)
 
-    def register(self, account_id: str, password: str) -> ApiKeyRecord:
+    def register(self, account_id: str, password: str, client_ip: str | None = None) -> ApiKeyRecord:
         existing = self.by_account.get(account_id)
         if existing is not None and existing.password_hash is not None:
             raise AccountExistsError(f"{account_id} is already registered")
-        record = existing if existing is not None else self._new_record(account_id, active=True)
+        is_new_account = existing is None
+        over_limit = (
+            client_ip is not None
+            and is_new_account
+            and len(self.registrations_by_ip.get(client_ip, [])) >= self.MAX_SELF_SERVE_ACCOUNTS_PER_IP
+        )
+        record = existing if existing is not None else self._new_record(account_id, active=not over_limit)
         salt = os.urandom(16)
         record.password_salt = salt
         record.password_hash = _hash_password(password, salt)
-        record.active = True
+        # Past the per-IP limit, leave a brand-new account inactive (same
+        # state as an admin-issued key) rather than force it active — the
+        # password is still set so the student can log in the moment an
+        # admin approves it, no need to register again.
+        if not over_limit:
+            record.active = True
+        if client_ip is not None and is_new_account:
+            self.registrations_by_ip.setdefault(client_ip, []).append(account_id)
         return record
 
     def login(self, account_id: str, password: str) -> ApiKeyRecord | None:

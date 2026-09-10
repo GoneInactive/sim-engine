@@ -7,6 +7,7 @@ from typing import Optional
 
 _order_id_counter = itertools.count(1)
 _fill_id_counter = itertools.count(1)
+_adjustment_id_counter = itertools.count(1)
 
 
 def next_order_id() -> int:
@@ -15,6 +16,15 @@ def next_order_id() -> int:
 
 def next_fill_id() -> int:
     return next(_fill_id_counter)
+
+
+def next_adjustment_id() -> int:
+    return next(_adjustment_id_counter)
+
+
+def advance_adjustment_id_counter(past: int) -> None:
+    global _adjustment_id_counter
+    _adjustment_id_counter = itertools.count(past + 1)
 
 
 def advance_order_id_counter(past: int) -> None:

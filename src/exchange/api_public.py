@@ -5,7 +5,7 @@ import asyncio
 import time
 from typing import Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -40,7 +40,7 @@ class ChatIn(BaseModel):
 
 
 def create_public_app(state: AppState) -> FastAPI:
-    app = FastAPI(title="Mini-Exchange Public API")
+    app = FastAPI(title=f"{state.config.exchange_name} Public API")
     limiter = TokenBucketLimiter(state.config.rate_limit.requests_per_second, state.config.rate_limit.burst)
 
     # The website (a different origin/port) trades on a student's behalf
@@ -71,15 +71,20 @@ def create_public_app(state: AppState) -> FastAPI:
         return record
 
     @app.post("/register")
-    def register(body: RegisterIn):
+    def register(body: RegisterIn, request: Request):
         """Self-serve: username + password. Active immediately, no admin
         approval step — deposits the starting cash and generates a key
-        right away."""
+        right away, unless this IP has already self-registered more than
+        AuthStore.MAX_SELF_SERVE_ACCOUNTS_PER_IP accounts, in which case the
+        new account is created but stays inactive until an admin approves it
+        (POST /accounts/{key}/activate on the admin API)."""
+        client_ip = request.client.host if request.client else None
         try:
-            key = state.register_student(body.account_id, body.password)
+            key = state.register_student(body.account_id, body.password, client_ip)
         except AccountExistsError:
             raise HTTPException(status_code=409, detail="account already registered, use /login")
-        return {"account_id": body.account_id, "api_key": key, "active": True}
+        record = state.auth.key_for_account(body.account_id)
+        return {"account_id": body.account_id, "api_key": key, "active": record.active if record else True}
 
     @app.post("/login")
     def login(body: LoginIn):
@@ -96,7 +101,7 @@ def create_public_app(state: AppState) -> FastAPI:
                 "symbol": symbol,
                 "underlying": p.underlying,
                 "contract_size": p.contract_size,
-                "max_position": p.max_position,
+                "leverage": p.leverage,
                 "index_price": state.index_service.get_index_price(symbol, now),
             }
             for symbol, p in state.config.products.items()

@@ -37,12 +37,21 @@ class NetworkConfig:
 
 
 @dataclass(frozen=True)
+class RiskConfig:
+    default_leverage: float
+
+
+@dataclass(frozen=True)
 class ProductConfig:
     symbol: str
     underlying: str
     contract_size: float
-    max_position: int
     tick_size: float
+    # Position cap is relative, not a fixed contract count: see
+    # ledger.max_position_for. `leverage` is this instrument's own
+    # override; every construction site falls back to
+    # risk.default_leverage when the underlying config doesn't set one.
+    leverage: float = 5.0
     starting_price: float = 75.0
     annual_volatility: float = 0.6
     annual_drift: float = 0.0
@@ -97,12 +106,13 @@ class SpreadInstrumentConfig:
     btc_product: str
     eth_product: str
     contract_size: float
-    max_position: int
     tick_size: float
+    leverage: float = 5.0
 
 
 @dataclass(frozen=True)
-class OptionsConfig:
+class OptionsChainConfig:
+    id: str
     enabled_default: bool
     underlying: str
     window_seconds: float
@@ -110,14 +120,52 @@ class OptionsConfig:
     strike_increment: float
     implied_volatility: float
     contract_size: float
-    max_position: int
     tick_size: float
+    leverage: float = 5.0
+
+
+@dataclass(frozen=True)
+class FuturesConfig:
+    enabled_default: bool
+    underlyings: tuple[str, ...]
+    window_seconds: float
+    num_live: int
+    tick_size: float
+    leverage: float = 5.0
+
+
+@dataclass(frozen=True)
+class MMBotDefaults:
+    legs: int
+    min_spread_ticks: float
+    delta_ticks: float
+    quote_size: int
+    skew_sensitivity: float
+    requote_interval: float
+
+
+@dataclass(frozen=True)
+class MMBotsConfig:
+    default: MMBotDefaults
+    options: MMBotDefaults
+    futures: MMBotDefaults
+
+
+@dataclass(frozen=True)
+class InsiderBotsConfig:
+    enabled_default: bool
+    count: int
+    lead_seconds: float
+    size: int
+    hold_after_seconds: float
 
 
 @dataclass(frozen=True)
 class Config:
+    exchange_name: str
     network: NetworkConfig
     database_url: str
+    risk: RiskConfig
     products: dict[str, ProductConfig]
     accounts: AccountsConfig
     feed: FeedConfig
@@ -127,7 +175,10 @@ class Config:
     admin_password: str
     website_password: str
     spread: SpreadInstrumentConfig
-    options: OptionsConfig
+    options: dict[str, OptionsChainConfig]
+    futures: FuturesConfig
+    mm_bots: MMBotsConfig
+    insider_bots: InsiderBotsConfig
 
 
 def load_config(path: Path | str | None = None) -> Config:
@@ -154,13 +205,16 @@ def load_config(path: Path | str | None = None) -> Config:
         website_base_url=_env("WEBSITE_BASE_URL", net["public"]["website_base_url"]),
     )
 
+    risk_raw = raw.get("risk", {})
+    risk = RiskConfig(default_leverage=float(risk_raw.get("default_leverage", 5.0)))
+
     products = {
         symbol: ProductConfig(
             symbol=symbol,
             underlying=p["underlying"],
             contract_size=float(p["contract_size"]),
-            max_position=int(p["max_position"]),
             tick_size=float(p["tick_size"]),
+            leverage=float(p.get("leverage", risk.default_leverage)),
             starting_price=float(p.get("starting_price", 75.0)),
             annual_volatility=float(p.get("annual_volatility", 0.6)),
             annual_drift=float(p.get("annual_drift", 0.0)),
@@ -207,26 +261,68 @@ def load_config(path: Path | str | None = None) -> Config:
         btc_product=spread_raw.get("btc_product", "BTC-MINI"),
         eth_product=spread_raw.get("eth_product", "ETH-MINI"),
         contract_size=float(spread_raw.get("contract_size", 1.0)),
-        max_position=int(spread_raw.get("max_position", 15)),
         tick_size=float(spread_raw.get("tick_size", 0.10)),
+        leverage=float(spread_raw.get("leverage", risk.default_leverage)),
     )
 
     options_raw = raw.get("options", {})
-    options = OptionsConfig(
-        enabled_default=bool(options_raw.get("enabled_default", False)),
-        underlying=options_raw.get("underlying", "BTC-MINI"),
-        window_seconds=float(options_raw.get("window_seconds", 900.0)),
-        strikes_each_side=int(options_raw.get("strikes_each_side", 5)),
-        strike_increment=float(options_raw.get("strike_increment", 1.0)),
-        implied_volatility=float(options_raw.get("implied_volatility", 0.55)),
-        contract_size=float(options_raw.get("contract_size", 1.0)),
-        max_position=int(options_raw.get("max_position", 15)),
-        tick_size=float(options_raw.get("tick_size", 0.01)),
+    options = {
+        chain_id: OptionsChainConfig(
+            id=chain_id,
+            enabled_default=bool(c.get("enabled_default", False)),
+            underlying=c.get("underlying", "BTC-MINI"),
+            window_seconds=float(c.get("window_seconds", 900.0)),
+            strikes_each_side=int(c.get("strikes_each_side", 5)),
+            strike_increment=float(c.get("strike_increment", 1.0)),
+            implied_volatility=float(c.get("implied_volatility", 0.55)),
+            contract_size=float(c.get("contract_size", 1.0)),
+            tick_size=float(c.get("tick_size", 0.01)),
+            leverage=float(c.get("leverage", risk.default_leverage)),
+        )
+        for chain_id, c in options_raw.items()
+    }
+
+    futures_raw = raw.get("futures", {})
+    futures = FuturesConfig(
+        enabled_default=bool(futures_raw.get("enabled_default", False)),
+        underlyings=tuple(futures_raw.get("underlyings", [])),
+        window_seconds=float(futures_raw.get("window_seconds", 3600.0)),
+        num_live=int(futures_raw.get("num_live", 5)),
+        tick_size=float(futures_raw.get("tick_size", 0.10)),
+        leverage=float(futures_raw.get("leverage", risk.default_leverage)),
+    )
+
+    def _mm_defaults(d: dict) -> MMBotDefaults:
+        return MMBotDefaults(
+            legs=int(d.get("legs", 3)),
+            min_spread_ticks=float(d.get("min_spread_ticks", 2.0)),
+            delta_ticks=float(d.get("delta_ticks", 1.0)),
+            quote_size=int(d.get("quote_size", 3)),
+            skew_sensitivity=float(d.get("skew_sensitivity", 0.05)),
+            requote_interval=float(d.get("requote_interval", 1.5)),
+        )
+
+    mm_bots_raw = raw.get("mm_bots", {})
+    mm_bots = MMBotsConfig(
+        default=_mm_defaults(mm_bots_raw.get("default", {})),
+        options=_mm_defaults(mm_bots_raw.get("options", mm_bots_raw.get("default", {}))),
+        futures=_mm_defaults(mm_bots_raw.get("futures", mm_bots_raw.get("default", {}))),
+    )
+
+    insider_raw = raw.get("insider_bots", {})
+    insider_bots = InsiderBotsConfig(
+        enabled_default=bool(insider_raw.get("enabled_default", False)),
+        count=int(insider_raw.get("count", 2)),
+        lead_seconds=float(insider_raw.get("lead_seconds", 5.0)),
+        size=int(insider_raw.get("size", 5)),
+        hold_after_seconds=float(insider_raw.get("hold_after_seconds", 8.0)),
     )
 
     return Config(
+        exchange_name=raw.get("exchange_name", "miniX"),
         network=network,
         database_url=_env("DATABASE_URL", raw["database"]["url"]),
+        risk=risk,
         products=products,
         accounts=accounts,
         feed=feed,
@@ -237,4 +333,7 @@ def load_config(path: Path | str | None = None) -> Config:
         website_password=_env("WEBSITE_PASSWORD", raw["website"]["password"]),
         spread=spread,
         options=options,
+        futures=futures,
+        mm_bots=mm_bots,
+        insider_bots=insider_bots,
     )
