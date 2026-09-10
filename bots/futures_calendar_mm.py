@@ -23,6 +23,14 @@ Usage: edit the Config block below (BASE_URL/WS_BASE_URL for a hosted
 instance, ACCOUNT_ID/PASSWORD for your account), then:
 
     python bots/futures_calendar_mm.py
+
+Dependency gotcha: this needs the `websocket-client` package, but PyPI also
+has an unrelated package literally called `websocket` that installs into
+the exact same `websocket` import namespace — if both (or just the wrong
+one) end up installed, `import websocket` succeeds but
+`websocket.create_connection` doesn't exist, and every poll fails with
+`module 'websocket' has no attribute 'create_connection'`. Fix:
+`pip uninstall websocket; pip install websocket-client`.
 """
 import json
 import math
@@ -30,8 +38,17 @@ import signal
 import time
 
 import requests
-import websocket
 from requests.adapters import HTTPAdapter
+
+try:
+    from websocket import create_connection
+except ImportError as e:
+    raise ImportError(
+        "could not import create_connection from `websocket` — you have the wrong "
+        "package installed (there's an unrelated PyPI package literally called "
+        "`websocket` that shadows the same import name as `websocket-client`). "
+        "Run: pip uninstall websocket; pip install websocket-client"
+    ) from e
 
 ##
 ## Config
@@ -117,7 +134,7 @@ def cancel_order(order_id, headers):
 ## empty), so this doesn't need a persistent connection to stay current.
 ##
 def fetch_futures_matrix():
-    ws = websocket.create_connection(
+    ws = create_connection(
         f"{Config.WS_URL}?channels=futures_matrix", timeout=Config.MATRIX_POLL_TIMEOUT,
     )
     try:

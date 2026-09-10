@@ -77,16 +77,33 @@ def would_breach_max_position(pos: Position, side: Side, qty: int, max_position:
     return abs(prospective) > max_position
 
 
-def max_position_for(cash: float, leverage: float, mark_price: float | None) -> int:
+def max_position_for(cash: float, leverage: float, mark_price: float | None, tick_size: float | None = None) -> int:
     """Balance-relative position cap, replacing the old fixed-contract-count
     MAX_POSITION: an account can hold up to `leverage` times its own cash in
     notional (cash and mark_price both real dollars — mark_price is the
     instrument's current contract-scaled index price, already the "price of
     one contract", not the raw underlying price). Floors at 1 contract (a
     student with a nonnegative balance can always place a starter order)
-    unless cash itself is negative, and at 0 when there's no price yet to
-    size against."""
-    if mark_price is None or mark_price == 0:
+    unless cash itself is negative, and at 0 when there's genuinely no price
+    to size against yet (mark_price is None, e.g. before the first tick).
+
+    mark_price == 0 is not the same situation as mark_price is None: a
+    calendar spread (near - far) is a legitimate instrument that's simply
+    *worth* exactly zero right now (both legs tracking spot 1:1 — see
+    FuturesChainManager's own docstring) — that's real, current pricing
+    data, not a missing one. Treating it the same as "no price yet" made
+    every calendar spread permanently untradable (by anyone, including the
+    exchange's own MM bots) for as long as it sat at parity, which per that
+    same docstring is most of the time — not a risk control, just a dead
+    market. `tick_size` (the smallest price move the instrument can
+    actually make) stands in for the sizing price in that case instead,
+    so the cap reflects "this could move by at least a tick and that has
+    real dollar consequences" rather than "this is worth nothing, so you
+    may hold none of it"."""
+    if mark_price is None:
+        return 0
+    sizing_price = mark_price if mark_price != 0 else tick_size
+    if not sizing_price:
         return 0
     notional_capacity = max(cash, 0.0) * leverage
-    return max(1, int(notional_capacity / abs(mark_price)))
+    return max(1, int(notional_capacity / abs(sizing_price)))

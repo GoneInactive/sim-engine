@@ -54,8 +54,8 @@ import requests
 from requests.adapters import HTTPAdapter
 
 BASE_URL: str = "http://178.105.55.5:8000"
-ACCOUNT_ID: str = "daytek"
-PASSWORD: str = "poop"
+ACCOUNT_ID: str = "FTX"
+PASSWORD: str = "dev"
 
 SPREAD_SYMBOL: str = "BTC-ETH-MINI"
 BTC_SYMBOL: str = "BTC-MINI"

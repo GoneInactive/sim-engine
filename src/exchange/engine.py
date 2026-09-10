@@ -312,7 +312,7 @@ class MatchingEngine:
             # 77500.0), not the ~77.5 contract-notional price everything
             # else in this cap is denominated in.
             mark_price = product_cfg.starting_price * product_cfg.contract_size
-        max_position = ledger.max_position_for(account.cash, product_cfg.leverage, mark_price)
+        max_position = ledger.max_position_for(account.cash, product_cfg.leverage, mark_price, product_cfg.tick_size)
         if abs(prospective) > max_position:
             raise OrderRejected(
                 f"order would breach MAX_POSITION ({max_position}, {product_cfg.leverage}x balance) for {product}"

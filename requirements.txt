@@ -7,3 +7,4 @@ pyyaml>=6.0
 httpx>=0.27
 pytest>=8.0
 pytest-asyncio>=0.24
+websocket-client>=1.6  # bots/ scripts and notebook student bots that read the website's /ws channels — NOT the unrelated `websocket` PyPI package, which shadows the same import name
