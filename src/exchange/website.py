@@ -891,7 +891,7 @@ def create_website_app(state: AppState) -> FastAPI:
     app = FastAPI(title=f"{state.config.exchange_name} Website")
 
     nav = (
-        '<nav><a href="/">Order Books</a><a href="/options">Options Chain</a>'
+        '<nav><a href="/">Spot</a><a href="/options">Options Chain</a>'
         '<a href="/inter-spread">Inter-Spread</a><a href="/leaderboard">Leaderboard</a>'
         '<a href="/portfolio">Portfolio</a><a href="/chat">Chat</a>'
         f'<a href="{state.config.network.admin_api_base_url}/" target="_blank">Admin</a></nav>'
@@ -908,7 +908,14 @@ def create_website_app(state: AppState) -> FastAPI:
         cols = ""
         for product, cfg in state.config.products.items():
             cols += _ladder_block(product, cfg.tick_size)
-        return page(f'<div class="cols">{cols}</div>')
+        spread_symbol = state.config.spread.symbol
+        cols += _ladder_block(spread_symbol, state.config.spread.tick_size)
+        banner = (
+            "" if state.spread_enabled else
+            f'<p class="meta">The {spread_symbol} spread instrument is currently disabled by the admin. '
+            "The book below will populate once it's re-enabled.</p>"
+        )
+        return page(f"<h2>Spot</h2>{banner}" + f'<div class="cols">{cols}</div>')
 
     @app.get("/inter-spread", response_class=HTMLResponse)
     def inter_spread_matrix():

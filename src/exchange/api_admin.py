@@ -430,6 +430,14 @@ def create_admin_app(state: AppState) -> FastAPI:
                 return {"account_id": account_id, "config": bot.config.__dict__}
         raise HTTPException(status_code=404, detail="no such insider bot")
 
+    @app.get("/products", dependencies=[Depends(admin_auth)])
+    def list_products():
+        # Every currently-live tradeable symbol — base products, the
+        # BTC-ETH spread, and whatever options/futures/calendar-spread
+        # contracts are live right now — so the MM bot spawn form can
+        # target any of them, not just the static base products.
+        return sorted(state.engine.products.keys())
+
     @app.get("/accounts", dependencies=[Depends(admin_auth)])
     def list_accounts():
         return [
@@ -697,7 +705,11 @@ ADMIN_PAGE = """<!doctype html>
 <div class="row">
   <fieldset>
     <legend>Spawn MM bot</legend>
-    <label>Product<select id="spawn-mm-product">__PRODUCT_OPTIONS__</select></label>
+    <label>Product/contract (any live symbol — base product, the BTC-ETH
+      spread, an options contract, a futures contract, a calendar spread)
+      <input id="spawn-mm-product" list="all-products-datalist" placeholder="e.g. BTC-MINI or BTC-ETH-MINI">
+      <datalist id="all-products-datalist"></datalist>
+    </label>
     <label>Legs<input id="spawn-mm-legs" value="3"></label>
     <label>Min spread (ticks)<input id="spawn-mm-minspread" value="2"></label>
     <label>Delta (ticks)<input id="spawn-mm-delta" value="1"></label>
@@ -1116,6 +1128,12 @@ function setSpreadEnabled(enabled) {
   callApi('POST', '/instruments/spread/enabled', { enabled }).then(loadSpread);
 }
 
+async function loadAllProducts() {
+  const res = await fetch('/products');
+  const symbols = await res.json();
+  document.getElementById('all-products-datalist').innerHTML = symbols.map(s => `<option value="${s}">`).join('');
+}
+
 loadAccounts();
 loadBots();
 loadNoiseBots();
@@ -1124,10 +1142,12 @@ loadInsiderBots();
 loadOptions();
 loadFutures();
 loadSpread();
+loadAllProducts();
 setInterval(loadOptions, 5000);
 setInterval(loadFutures, 5000);
 setInterval(loadSpread, 5000);
 setInterval(loadInsiderBots, 5000);
+setInterval(loadAllProducts, 5000);
 </script>
 </body>
 </html>"""
