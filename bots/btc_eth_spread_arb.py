@@ -61,15 +61,15 @@ from requests.adapters import HTTPAdapter
 ##
 class Config:
     BASE_URL: str = "http://178.105.55.5:8000"
-    ACCOUNT_ID: str = "my-spread-arb-bot"
-    PASSWORD: str = "change-me"
+    ACCOUNT_ID: str = "SIG"
+    PASSWORD: str = "dev"
 
     SPREAD_SYMBOL: str = "BTC-ETH-MINI"
     BTC_SYMBOL: str = "BTC-MINI"
     ETH_SYMBOL: str = "ETH-MINI"
 
     TICK_SIZE: float = 0.10   # shared by BTC-MINI/ETH-MINI/BTC-ETH-MINI (config.yaml)
-    MIN_EDGE_TICKS: int = 3   # combo profit must clear this many ticks per unit — comfortably covers 3 legs' worth of taker fee
+    MIN_EDGE_TICKS: int = 4   # combo profit must clear this many ticks per unit — comfortably covers 3 legs' worth of taker fee
     SPREAD_LEVERAGE: float = 5.0  # config.yaml -> spread.leverage (falls back to risk.default_leverage)
 
     POLL_INTERVAL: float = 0.0
@@ -98,10 +98,11 @@ def _request(method, url, **kwargs):
         r = SESSION.request(method, url, **kwargs)
     return r
 
-def register_or_login(account_id, password):
-    r = _request("POST", f"{Config.BASE_URL}/register", json={"account_id": account_id, "password": password})
-    if r.status_code == 409:
-        r = _request("POST", f"{Config.BASE_URL}/login", json={"account_id": account_id, "password": password})
+def login(account_id, password):
+    """Your account already exists — plain /login, no register-then-409-
+    fallback dance (that pattern is for a brand-new student account, see
+    notebook/vol_trader.py's docstring; this is your own private account)."""
+    r = _request("POST", f"{Config.BASE_URL}/login", json={"account_id": account_id, "password": password})
     r.raise_for_status()
     return r.json()["api_key"]
 
@@ -226,7 +227,7 @@ def main():
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
-    api_key = register_or_login(Config.ACCOUNT_ID, Config.PASSWORD)
+    api_key = login(Config.ACCOUNT_ID, Config.PASSWORD)
     headers = {"X-API-Key": api_key}
     print(f"logged in as {Config.ACCOUNT_ID}")
 

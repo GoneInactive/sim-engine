@@ -332,6 +332,21 @@ No auth. Ranked by `equity` descending. Excludes bot accounts (`mm_`,
 ]
 ```
 
+### `GET /portfolio/{account_id}`
+
+No auth — read-only view of **any** account's portfolio, not just your
+own. Same shape your own `GET /account` returns, plus `recent_fills`
+(last 50) and `open_orders`, i.e. identical to what `GET /account` +
+`GET /fills` + `GET /orders` would give you about your own account. Not
+materially more sensitive than `GET /leaderboard`, which already
+publishes every account's cash/equity/positions with no auth.
+
+Response `404` for an unknown `account_id`: `{"detail": "no such account"}`.
+
+The website's `/portfolio/{account_id}` page (and each leaderboard row's
+account link) is the same data, pushed live over the `portfolio_of:<account_id>`
+WS channel.
+
 ---
 
 ## Admin API (port 8001)

@@ -46,6 +46,9 @@ PAGE_TEMPLATE = """<!doctype html>
   body {{ background:#fff; color:#000; font-family: ui-monospace, monospace; margin:0; padding:24px; }}
   h1, h2 {{ color:#000; font-weight:600; margin:24px 0 8px; }}
   nav a {{ color:#000; text-decoration:none; margin-right:20px; border-bottom:1px solid #000; }}
+  .chat-badge {{ display:inline-block; background:#b00020; color:#fff; font-size:10px; font-weight:700;
+    border-radius:8px; min-width:15px; height:15px; line-height:15px; text-align:center; padding:0 3px;
+    margin-left:4px; vertical-align:2px; }}
   table {{ border-collapse:collapse; width:100%; margin-bottom:12px; }}
   th, td {{ text-align:left; padding:3px 10px; border-bottom:1px solid #000; font-size:13px; }}
   th {{ font-weight:600; }}
@@ -165,8 +168,26 @@ function onChannel(name, cb) {{
 function wantedChannels() {{
   const channels = new Set(window.__wsChannels || []);
   if (getKey()) channels.add('portfolio');
+  channels.add('chat'); // always on, everywhere — see updateChatBadge below
   return Array.from(channels);
 }}
+
+// -- unread chat badge on the nav link, on every page -----------------------
+let lastSeenChatId = parseInt(localStorage.getItem('exchange-last-seen-chat-id') || '0', 10);
+function updateChatBadge(messages) {{
+  const badge = document.getElementById('chat-badge');
+  if (!badge) return;
+  const unread = messages.filter((m) => m.id > lastSeenChatId).length;
+  badge.textContent = unread > 0 ? String(unread) : '';
+  badge.hidden = unread === 0;
+}}
+function markChatRead(messages) {{
+  if (!messages.length) return;
+  lastSeenChatId = messages[messages.length - 1].id;
+  localStorage.setItem('exchange-last-seen-chat-id', String(lastSeenChatId));
+  updateChatBadge(messages);
+}}
+onChannel('chat', updateChatBadge);
 function connectSocket() {{
   if (socketReconnectTimer) {{ clearTimeout(socketReconnectTimer); socketReconnectTimer = null; }}
   if (socket) {{ try {{ socket.onclose = null; socket.close(); }} catch (e) {{}} }}
@@ -921,7 +942,8 @@ def create_website_app(state: AppState) -> FastAPI:
     nav = (
         '<nav><a href="/">Spot</a><a href="/options">Options Chain</a>'
         '<a href="/inter-spread">Inter-Spread</a><a href="/rfq">RFQs</a><a href="/leaderboard">Leaderboard</a>'
-        '<a href="/portfolio">Portfolio</a><a href="/chat">Chat</a>'
+        '<a href="/portfolio">Portfolio</a>'
+        '<a href="/chat">Chat<span id="chat-badge" class="chat-badge" hidden></span></a>'
         f'<a href="{state.config.network.admin_api_base_url}/" target="_blank">Admin</a></nav>'
     )
 
@@ -1321,10 +1343,65 @@ onChannel('rfqs', renderRfqs);
 window.__wsChannels = ['leaderboard'];
 onChannel('leaderboard', (rows) => {
   document.getElementById('lb').innerHTML = rows.map((r, i) =>
-    `<tr><td>${i+1}</td><td>${r.account_id}</td><td>$${r.cash.toFixed(2)}</td>` +
+    `<tr><td>${i+1}</td>` +
+    `<td><a href="/portfolio/${encodeURIComponent(r.account_id)}">${r.account_id}</a></td>` +
+    `<td>$${r.cash.toFixed(2)}</td>` +
     `<td>$${r.equity.toFixed(2)}</td><td>${JSON.stringify(r.positions)}</td></tr>`
   ).join('');
 });
+</script>
+"""
+        return page(body)
+
+    @app.get("/portfolio/{account_id}", response_class=HTMLResponse)
+    def view_portfolio(account_id: str):
+        """Read-only view of *someone else's* portfolio — same data the
+        leaderboard already exposes with no auth (account_id/cash/equity/
+        positions), extended to the same fill/order detail your own
+        `/portfolio` page shows, since none of that is any more sensitive
+        than what the leaderboard already publishes. No trading controls
+        (no flatten/cancel — this isn't your account)."""
+        if account_id not in state.engine.accounts:
+            return page(f'<h2>Portfolio: {account_id}</h2><p class="meta">no such account.</p>')
+        channel = f"portfolio_of:{account_id}"
+        body = f"""
+<h2>Portfolio: {account_id}</h2>
+<div class="metrics" id="pf-summary"></div>
+
+<h2>Positions</h2>
+<table><thead><tr><th>Product</th><th>Qty</th><th>Avg cost</th></tr></thead>
+<tbody id="pf-positions"></tbody></table>
+
+<h2>Open orders</h2>
+<table><thead><tr><th>ID</th><th>Product</th><th>Side</th><th>Type</th><th>Qty</th><th>Price</th><th>Remaining</th><th>Status</th></tr></thead>
+<tbody id="pf-orders"></tbody></table>
+
+<h2>Recent fills</h2>
+<table><thead><tr><th>Product</th><th>Side</th><th>Role</th><th>Price</th><th>Qty</th><th>Counterparty</th><th>Time</th></tr></thead>
+<tbody id="pf-fills"></tbody></table>
+
+<script>
+window.__wsChannels = ['{channel}'];
+onChannel('{channel}', (d) => {{
+  if (!d) return;
+  const fmt = (v) => v.toFixed(2);
+  document.getElementById('pf-summary').innerHTML =
+    `<div>account <span>${{d.account_id}}</span></div>` +
+    `<div>frozen <span>${{d.frozen}}</span></div>` +
+    `<div>balance <span>$${{fmt(d.balance)}}</span></div>` +
+    `<div>equity <span>$${{fmt(d.equity)}}</span></div>`;
+  document.getElementById('pf-positions').innerHTML = Object.entries(d.positions).map(([p, pos]) =>
+    `<tr><td>${{p}}</td><td>${{pos.qty}}</td><td>$${{pos.avg_cost.toFixed(2)}}</td></tr>`
+  ).join('') || '<tr><td colspan="3">flat</td></tr>';
+  document.getElementById('pf-orders').innerHTML = d.open_orders.map(o =>
+    `<tr><td>${{o.id}}</td><td>${{o.product}}</td><td>${{o.side}}</td><td>${{o.type}}</td>` +
+    `<td>${{o.qty}}</td><td>${{o.price ?? ''}}</td><td>${{o.remaining_qty}}</td><td>${{o.status}}</td></tr>`
+  ).join('') || '<tr><td colspan="8">none</td></tr>';
+  document.getElementById('pf-fills').innerHTML = d.recent_fills.map(f =>
+    `<tr><td>${{f.product}}</td><td>${{f.side}}</td><td>${{f.role}}</td><td>${{f.price.toFixed(2)}}</td>` +
+    `<td>${{f.qty}}</td><td>${{f.counterparty}}</td><td>${{new Date(f.timestamp * 1000).toLocaleTimeString()}}</td></tr>`
+  ).join('') || '<tr><td colspan="7">none yet</td></tr>';
+}});
 </script>
 """
         return page(body)
@@ -1455,6 +1532,7 @@ function renderChatLog(messages) {
 }
 window.__wsChannels = ['chat'];
 onChannel('chat', renderChatLog);
+onChannel('chat', markChatRead); // visiting this page reads everything currently loaded
 
 async function sendChat() {
   const key = getKey();
@@ -1530,6 +1608,14 @@ async function sendChat() {
             if record is None:
                 return {"error": "invalid_key"}
             return state.portfolio(record.account_id)
+        if channel.startswith("portfolio_of:"):
+            # Read-only view of someone else's portfolio — no key needed,
+            # same public-by-design data the leaderboard already exposes
+            # (see the /portfolio/{account_id} route's docstring).
+            account_id = channel[len("portfolio_of:"):]
+            if account_id not in state.engine.accounts:
+                return None
+            return state.portfolio(account_id)
         return None
 
     @app.websocket("/ws")

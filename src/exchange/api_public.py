@@ -199,6 +199,18 @@ def create_public_app(state: AppState) -> FastAPI:
     def get_leaderboard():
         return state.leaderboard()
 
+    @app.get("/portfolio/{account_id}")
+    def get_portfolio_of(account_id: str):
+        """No auth: read-only view of *any* account's portfolio — same
+        shape your own GET /account plus fills/orders returns. Not
+        materially more sensitive than GET /leaderboard, which already
+        publishes every account's cash/equity/positions with no auth; this
+        just adds the order/fill detail the website's own
+        /portfolio/{account_id} page shows."""
+        if account_id not in state.engine.accounts:
+            raise HTTPException(status_code=404, detail="no such account")
+        return state.portfolio(account_id)
+
     @app.post("/chat")
     def post_chat(body: ChatIn, auth: ApiKeyRecord = Depends(auth_dep)):
         try:

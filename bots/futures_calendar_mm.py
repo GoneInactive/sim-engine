@@ -56,8 +56,8 @@ except ImportError as e:
 class Config:
     BASE_URL: str = "http://178.105.55.5:8000"       # public trading API
     WS_URL: str = "ws://178.105.55.5:8090/ws"         # website's multi-channel WS (unauthenticated)
-    ACCOUNT_ID: str = "my-mm-bot"
-    PASSWORD: str = "change-me"
+    ACCOUNT_ID: str = "CTC"
+    PASSWORD: str = "dev"
 
     # Which futures underlyings to make markets on — must match (a subset
     # of) config.yaml's futures.underlyings on the server; quoting a
@@ -85,8 +85,7 @@ SESSION.mount("http://", _ADAPTER)
 SESSION.mount("https://", _ADAPTER)
 
 ##
-## API call functions — same register-or-login + 429 retry/backoff pattern
-## as notebook/vol_trader.py.
+## API call functions — same 429 retry/backoff pattern as notebook/vol_trader.py.
 ##
 def _request(method, url, **kwargs):
     delay = Config.RETRY_BACKOFF
@@ -100,10 +99,11 @@ def _request(method, url, **kwargs):
         r = SESSION.request(method, url, **kwargs)
     return r
 
-def register_or_login(account_id, password):
-    r = _request("POST", f"{Config.BASE_URL}/register", json={"account_id": account_id, "password": password})
-    if r.status_code == 409:
-        r = _request("POST", f"{Config.BASE_URL}/login", json={"account_id": account_id, "password": password})
+def login(account_id, password):
+    """Your account already exists — plain /login, no register-then-409-
+    fallback dance (that pattern is for a brand-new student account, see
+    notebook/vol_trader.py's docstring; this is your own private account)."""
+    r = _request("POST", f"{Config.BASE_URL}/login", json={"account_id": account_id, "password": password})
     r.raise_for_status()
     return r.json()["api_key"]
 
@@ -217,7 +217,7 @@ def main():
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
-    api_key = register_or_login(Config.ACCOUNT_ID, Config.PASSWORD)
+    api_key = login(Config.ACCOUNT_ID, Config.PASSWORD)
     headers = {"X-API-Key": api_key}
     print(f"logged in as {Config.ACCOUNT_ID}")
 

@@ -33,8 +33,20 @@ def bs_price(spot: float, strike: float, t_years: float, vol: float, option_type
     """Black-Scholes theoretical price, zero risk-free rate (a 15-minute
     teaching instrument doesn't need discounting). Falls back to intrinsic
     value once time-to-expiry or vol collapse to zero, where the standard
-    d1/d2 formula divides by zero."""
-    if t_years <= 0 or vol <= 0:
+    d1/d2 formula divides by zero — and also once `spot` isn't strictly
+    positive, where math.log(spot / strike) is undefined. `strike` itself
+    is always > 0 at chain creation (create_chain skips non-positive
+    strikes), but `spot` is re-read live on every price_tick — for the
+    btc_eth_spread chain (underlying is the BTC-ETH-MINI spread, whose
+    fair value can legitimately cross zero by design, see config.yaml's
+    `spread` comments) that means a contract created while spot was
+    positive can still see spot go to zero or negative later in its own
+    15-minute life, which used to crash the whole process with an
+    uncaught ValueError from math.log. Intrinsic value is still exactly
+    right in that regime (a call/put's payoff is well-defined for any
+    real spot, positive or not) — this is a real fallback, not a
+    approximation."""
+    if t_years <= 0 or vol <= 0 or spot <= 0:
         return max(spot - strike, 0.0) if option_type == "call" else max(strike - spot, 0.0)
     sqrt_t = math.sqrt(t_years)
     d1 = (math.log(spot / strike) + 0.5 * vol * vol * t_years) / (vol * sqrt_t)
